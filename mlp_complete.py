@@ -2,25 +2,36 @@
 # 1. IMPORTS & GLOBAL SETTINGS
 # -------------------------------------------------------------
 """
-MLP Stock Prediction Model - Complete Pipeline
------------------------------------------------
-This module implements a Multi-Layer Perceptron (MLP) classifier for stock 
-price movement prediction using technical indicators, fundamental data, 
-and sentiment analysis features.
+MLP Stock Prediction Model - PIPELINE HOÀN CHỈNH CHUẨN LUẬN VĂN
+----------------------------------------------------------------
+Pipeline gồm 8 phase: Tiền xử lý dữ liệu → Thống kê mô tả → Feature engineering
+→ Thiết kế biến mục tiêu → Chia dữ liệu → Mô hình hóa → Đánh giá → Diễn giải.
 
-Features:
-- Ablation study comparing different feature combinations
-- Time-series cross-validation
-- SHAP-based feature importance
-- Comprehensive visualization suite
+- Phase 1: Data Preprocessing (OHLC, Fundamental, News)
+- Phase 2: Descriptive Statistics (giá, fundamental, news)
+- Phase 3: Feature Engineering
+- Phase 4: Target Design (5-day extreme movers 20%-80%)
+- Phase 5: Data Split (time-based)
+- Phase 6: Modeling (MLP + Baseline)
+- Phase 7: Evaluation (AUC, CI, Wilcoxon)
+- Phase 8: Interpretation (SHAP, sector analysis)
 
 Author: [Your Name]
 Course: [Course Name]
 Date: 2026
 """
 import os
+import re
+import sys
 import warnings
 import numpy as np
+
+# Fix encoding console Windows (in tiếng Việt/emoji)
+if sys.stdout.encoding is None or sys.stdout.encoding.lower().startswith("cp"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -43,6 +54,7 @@ from sklearn.metrics import (
     precision_recall_curve,
 )
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.dummy import DummyClassifier
 
 # optional imbalanced‑learn for SMOTE
 try:
@@ -57,6 +69,8 @@ sns.set_style("whitegrid")
 plt.rcParams["figure.figsize"] = (14, 6)
 plt.rcParams["font.size"] = 12
 RANDOM_STATE = 42
+SPLIT_DATE = "2023-01-01"  # Time-based train/test split for reproducibility
+np.random.seed(RANDOM_STATE)  # Reproducibility (học thuật)
 
 # -------------------------------------------------------------
 # 2. PATHS
@@ -67,47 +81,244 @@ FUND_PATH = os.path.join(DATA_DIR, "fundamental.csv")
 NEWS_RAW_PATH = os.path.join(DATA_DIR, "news.csv")
 NEWS_SENT_PATH = os.path.join(DATA_DIR, "news_with_sentiment.csv")
 VIS_DIR = "visualizations"
+OUTPUT_DIR = "output"
 os.makedirs(VIS_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # -------------------------------------------------------------
-# 3. HELPER: clean column names (strip whitespace, lower‑case)
+# 3. HELPER: chuẩn hóa tên cột (lowercase, strip)
 # -------------------------------------------------------------
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [str(c).strip().lower() for c in df.columns]
     return df
 
 # -------------------------------------------------------------
-# 4. LOAD DATA
+# PHASE 1 — DATA PREPROCESSING (TIỀN XỬ LÝ DỮ LIỆU)
 # -------------------------------------------------------------
+
+def preprocess_ohlc(path: str):
+    """1️⃣ Tiền xử lý dữ liệu giá (OHLC): làm sạch, datetime, sort, drop dup; kiểm tra & xử lý missing (không forward fill giá)."""
+    df = clean_columns(pd.read_csv(path, parse_dates=["date"]))
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["mack", "date"]).drop_duplicates(subset=["mack", "date"], keep="first").reset_index(drop=True)
+    # Kiểm tra missing
+    n = len(df)
+    miss_close = df["close"].isna().sum()
+    miss_vol = df["volume"].isna().sum()
+    print(f"  Missing close: {miss_close} ({100*miss_close/n:.2f}%)")
+    print(f"  Missing volume: {miss_vol} ({100*miss_vol/n:.2f}%)")
+    # Không forward fill giá; drop nếu thiếu giá (no look-ahead)
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+    if "volume" in df.columns:
+        df["volume"] = df["volume"].fillna(0)
+    return df
+
+def preprocess_fundamental(path: str, fund_features: list):
+    """2️⃣ Tiền xử lý Fundamental: quý → ngày cuối quý, resample daily, forward fill theo ticker; kiểm tra outlier (PE âm, ROE bất thường), winsorize."""
+    df = clean_columns(pd.read_csv(path))
+    df["date"] = pd.to_datetime(
+        dict(year=df["nam"], month=df["quy"] * 3, day=1)
+    ) + pd.offsets.MonthEnd(0)
+    df = df.sort_values(["mack", "date"]).set_index("date").groupby("mack")[fund_features].resample("D").ffill().reset_index()
+    # Outlier: PE âm / ROE bất thường -> winsorize 1%-99%
+    for col in ["pe", "roe", "roa"]:
+        if col in df.columns:
+            q1, q99 = df[col].quantile(0.01), df[col].quantile(0.99)
+            df[col] = df[col].clip(lower=q1, upper=q99)
+    return df
+
+def _clean_text(s: str) -> str:
+    """Làm sạch text: lowercase, remove HTML, ký tự đặc biệt, khoảng trắng dư."""
+    if pd.isna(s):
+        return ""
+    s = str(s).lower().strip()
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"[^\w\s\u00c0-\u1ef9]", " ", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def preprocess_news(path_raw: str, path_sent: str):
+    """3️⃣ Tiền xử lý News: làm sạch text (headline); drop duplicate (mack, date, title); aggregation daily: mean(sent_score), std(sent_score), max(sent_pos), news_count (+ các cột sentiment khác). PhoBERT áp dụng trên tiêu đề bài viết."""
+    path = path_sent if os.path.exists(path_sent) else path_raw
+    news = clean_columns(pd.read_csv(path, parse_dates=["date"]))
+    news["date"] = pd.to_datetime(news["date"])
+    title_col = "title" if "title" in news.columns else None
+    if title_col:
+        news["title_clean"] = news[title_col].astype(str).apply(_clean_text)
+        news = news.drop_duplicates(subset=["mack", "date", "title_clean"], keep="first").reset_index(drop=True)
+    news = news.sort_values(["mack", "date"]).reset_index(drop=True)
+    sent_daily = pd.DataFrame()
+    if "sent_pos" in news.columns and "sent_score" in news.columns:
+        agg_spec = {}
+        for col, funcs in [
+            ("sent_pos", ["mean", "std", "max"]),
+            ("sent_neu", ["mean"]),
+            ("sent_neg", ["mean", "std", "max"]),
+            ("sent_score", ["mean", "std", "min", "max"]),
+        ]:
+            if col in news.columns:
+                agg_spec[col] = funcs
+        if agg_spec:
+            sent_daily = news.groupby(["mack", "date"]).agg(agg_spec)
+            sent_daily.columns = ["_".join(c) for c in sent_daily.columns]
+            sent_daily = sent_daily.reset_index()
+            news_cnt = news.groupby(["mack", "date"]).size().reset_index(name="news_count")
+            sent_daily = sent_daily.merge(news_cnt, on=["mack", "date"], how="left")
+    return news, sent_daily
+
+# --- Load data via Phase 1 ---
 print("=" * 60)
-print("Loading OHLC, fundamental & news data")
+print("PHASE 1 — DATA PREPROCESSING")
 print("=" * 60)
 
-ohlc = clean_columns(pd.read_csv(OHLC_PATH, parse_dates=["date"]))
-fundamental = clean_columns(pd.read_csv(FUND_PATH))
-# Load sentiment – if pre‑processed file exists we use it, otherwise raw news
-if os.path.exists(NEWS_SENT_PATH):
-    news = clean_columns(pd.read_csv(NEWS_SENT_PATH, parse_dates=["date"]))
-    print("✓ Loaded pre‑processed sentiment data")
-else:
-    news = clean_columns(pd.read_csv(NEWS_RAW_PATH, parse_dates=["date"]))
-    print("⚠️ Sentiment not pre‑processed – using raw news (no sentiment columns).")
+FUND_FEATURES = ["eps", "roe", "roa", "pb", "pe", "lnst_yoy", "nophaitra_vcsh", "vonhoa_tts"]
+FUND_FEATURES = [c for c in FUND_FEATURES if c in clean_columns(pd.read_csv(FUND_PATH, nrows=1)).columns]
+
+print("\n1️⃣ Tiền xử lý OHLC...")
+ohlc = preprocess_ohlc(OHLC_PATH)
+print("\n2️⃣ Tiền xử lý Fundamental...")
+fund_daily = preprocess_fundamental(FUND_PATH, FUND_FEATURES)
+print("\n3️⃣ Tiền xử lý News (headline; PhoBERT áp dụng trên tiêu đề bài viết)...")
+news, sent_daily = preprocess_news(NEWS_RAW_PATH, NEWS_SENT_PATH)
+# -------------------------------------------------------------
+# PHASE 2 — DESCRIPTIVE STATISTICS (THỐNG KÊ MÔ TẢ)
+# -------------------------------------------------------------
+def run_descriptive_stats_ohlc(ohlc_df):
+    """🔵 Thống kê dữ liệu giá: bảng tổng quan; histogram return 1d, 5d, volatility; nhận xét skew/fat-tail."""
+    o = ohlc_df.copy()
+    o["ret_1d"] = o.groupby("mack")["close"].transform(lambda x: x.pct_change(1))
+    o["ret_5d"] = o.groupby("mack")["close"].transform(lambda x: x.pct_change(5))
+    o["volatility_20d"] = o.groupby("mack")["close"].transform(lambda x: x.pct_change().rolling(20).std())
+    o = o.dropna(subset=["ret_1d", "ret_5d", "volatility_20d"])
+    n_stocks = o["mack"].nunique()
+    n_obs = len(o)
+    d_min, d_max = o["date"].min(), o["date"].max()
+    avg_days = n_obs / n_stocks if n_stocks else 0
+    tbl = pd.DataFrame([
+        ("Số mã cổ phiếu", n_stocks), ("Tổng số quan sát", f"{n_obs:,}"),
+        ("Khoảng thời gian", f"{d_min.date()} — {d_max.date()}"), ("Số ngày trung bình/mã", f"{avg_days:.1f}"),
+    ], columns=["Thống kê", "Giá trị"])
+    print(tbl.to_string(index=False))
+    tbl.to_csv(os.path.join(OUTPUT_DIR, "desc_ohlc_overview.csv"), index=False, encoding="utf-8-sig")
+    for name, col in [("Return 1-day", "ret_1d"), ("Return 5-day", "ret_5d"), ("Volatility 20d", "volatility_20d")]:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(o[col].dropna(), bins=80, color="#3498db", edgecolor="white", alpha=0.85)
+        ax.set_title(f"Phân phối {name}", fontweight="bold")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Tần suất")
+        plt.tight_layout()
+        plt.savefig(os.path.join(VIS_DIR, f"desc_ohlc_hist_{col}.png"), dpi=150)
+        plt.close()
+    skew_1, skew_5 = o["ret_1d"].skew(), o["ret_5d"].skew()
+    print(f"  Nhận xét: Return 1d skew={skew_1:.3f}, 5d skew={skew_5:.3f}. Fat-tail: |skew|>1 có thể có đuôi nặng.")
+
+def run_descriptive_stats_fundamental(fund_df, fund_features):
+    """🔵 Thống kê Fundamental: mean PE, ROE; std ROE; phân phối PE; outlier/skew."""
+    avail = [c for c in fund_features if c in fund_df.columns]
+    if not avail:
+        print("  (Không có cột fundamental để thống kê)")
+        return
+    f = fund_df[avail].dropna(how="all")
+    pe_col = "pe" if "pe" in f.columns else None
+    roe_col = "roe" if "roe" in f.columns else None
+    stats = []
+    if pe_col:
+        pe_pos = f.loc[f[pe_col] > 0, pe_col]
+        stats.append(("Mean PE", f"{pe_pos.mean():.2f}" if len(pe_pos) else "N/A"))
+    if roe_col:
+        stats.append(("Mean ROE", f"{f[roe_col].mean():.4f}"))
+        stats.append(("Std ROE", f"{f[roe_col].std():.4f}"))
+    if stats:
+        print(pd.DataFrame(stats, columns=["Thống kê", "Giá trị"]).to_string(index=False))
+    if pe_col and f[pe_col].notna().any():
+        fig, ax = plt.subplots(figsize=(7, 4))
+        pe_vals = f[pe_col].dropna().clip(upper=f[pe_col].quantile(0.99))
+        ax.hist(pe_vals, bins=50, color="#2ecc71", alpha=0.85)
+        ax.set_title("Phân phối PE (winsorized 99%)", fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(os.path.join(VIS_DIR, "desc_fund_pe_dist.png"), dpi=150)
+        plt.close()
+
+def run_descriptive_stats_news(news_df):
+    """🔵 Thống kê News: tổng quan; news theo DN (bảng + mean/median/min/max/std + nhận xét); histogram news/ngày, news/năm; phân phối sentiment."""
+    n = len(news_df)
+    nc = news_df["mack"].nunique()
+    d_min, d_max = news_df["date"].min(), news_df["date"].max()
+    n_days = (d_max - d_min).days + 1
+    avg_per_day = n / n_days if n_days else 0
+    tbl = pd.DataFrame([
+        ("Tổng số news", f"{n:,}"), ("Số DN có news", nc), ("Thời gian", f"{d_min.date()} — {d_max.date()}"), ("Trung bình news/ngày", f"{avg_per_day:.1f}"),
+    ], columns=["Thống kê", "Giá trị"])
+    print(tbl.to_string(index=False))
+    per_stock = news_df.groupby("mack").size().sort_values(ascending=False).reset_index()
+    per_stock.columns = ["Mã", "Số news"]
+    print(per_stock.to_string(index=False))
+    cnt = per_stock["Số news"]
+    print(f"  Mean={cnt.mean():.2f}, Median={cnt.median():.2f}, Min={cnt.min()}, Max={cnt.max()}, Std={cnt.std():.2f}")
+    max_s, max_n = per_stock.iloc[0]["Mã"], per_stock.iloc[0]["Số news"]
+    min_s, min_n = per_stock.iloc[-1]["Mã"], per_stock.iloc[-1]["Số news"]
+    print(f"  Nhận xét: Doanh nghiệp có số tin cao nhất là {max_s} với {max_n} bài; ít nhất là {min_s} với {min_n} bài. Mức độ phủ thông tin không đồng đều.")
+    per_stock.to_csv(os.path.join(OUTPUT_DIR, "news_by_company.csv"), index=False, encoding="utf-8-sig")
+    news_per_day = news_df.groupby("date").size()
+    plt.figure(figsize=(9, 4))
+    plt.hist(news_per_day.values, bins=50, color="#3498db", alpha=0.85)
+    plt.title("Histogram số news/ngày")
+    plt.xlabel("Số tin/ngày")
+    plt.ylabel("Tần suất")
+    plt.tight_layout()
+    plt.savefig(os.path.join(VIS_DIR, "news_histogram_per_day.png"), dpi=150)
+    plt.close()
+    news_df["_year"] = news_df["date"].dt.year
+    per_year = news_df.groupby("_year").size()
+    plt.figure(figsize=(8, 4))
+    plt.bar(per_year.index, per_year.values, color="#2ecc71", alpha=0.85)
+    plt.title("Số tin theo năm")
+    plt.xlabel("Năm")
+    plt.ylabel("Số tin")
+    plt.tight_layout()
+    plt.savefig(os.path.join(VIS_DIR, "news_bar_by_year.png"), dpi=150)
+    plt.close()
+    if "sent_score" in news_df.columns:
+        plt.figure(figsize=(7, 4))
+        plt.hist(news_df["sent_score"].dropna(), bins=50, color="#9b59b6", alpha=0.85)
+        plt.axvline(news_df["sent_score"].mean(), color="red", linestyle="--", label=f"Mean={news_df['sent_score'].mean():.3f}")
+        plt.title("Phân phối Sentiment Score")
+        plt.xlabel("sent_score")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(VIS_DIR, "news_sentiment_dist.png"), dpi=150)
+        plt.close()
+        if "sent_pos" in news_df.columns and "sent_neg" in news_df.columns:
+            print(f"  Mean positive prob: {news_df['sent_pos'].mean():.3f}; Mean negative prob: {news_df['sent_neg'].mean():.3f}")
+
+print("\n" + "=" * 60)
+print("PHASE 2 — DESCRIPTIVE STATISTICS")
+print("=" * 60)
+print("\n🔵 1. Thống kê dữ liệu giá (OHLC)")
+run_descriptive_stats_ohlc(ohlc)
+print("\n🔵 2. Thống kê dữ liệu Fundamental")
+run_descriptive_stats_fundamental(fund_daily, FUND_FEATURES)
+print("\n🔵 3. Thống kê dữ liệu News")
+run_descriptive_stats_news(news)
 
 # -------------------------------------------------------------
-# 5. TECHNICAL INDICATORS (enhanced but still lightweight)
+# PHASE 3 — FEATURE ENGINEERING
 # -------------------------------------------------------------
 print("\n" + "=" * 60)
-print("Computing technical indicators & Momentum")
+print("PHASE 3 — FEATURE ENGINEERING")
 print("=" * 60)
 
 def compute_rsi(series, window=14):
+    """RSI with safe handling of zero avg_loss to avoid inf/nan."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.rolling(window).mean()
     avg_loss = loss.rolling(window).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = rs.replace([np.inf, -np.inf], 1e10).fillna(1.0)  # no loss -> RSI 100; 0/0 -> RSI 50
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.clip(0, 100)
 
 # Simple moving averages
 for w in [5, 10, 20, 50]:
@@ -145,69 +356,13 @@ for lag in [1, 3, 5, 10]:
 # Volatility (Standard Deviation of returns over 20 days)
 ohlc["volatility_20d"] = ohlc.groupby("mack")["close"].transform(lambda x: x.pct_change().rolling(20).std())
 
-# -------------------------------------------------------------
-# 6. FUNDAMENTAL DATA – DAILY RESAMPLE
-# -------------------------------------------------------------
-print("\n" + "=" * 60)
-print("Processing fundamental data")
-print("=" * 60)
-
-# Convert year/quarter to month‑end date
-fundamental["date"] = pd.to_datetime(
-    dict(year=fundamental["nam"], month=fundamental["quy"] * 3, day=1)
-) + pd.offsets.MonthEnd(0)
-
-fund_features = [
-    "eps",
-    "roe",
-    "roa",
-    "pb",
-    "pe",
-    "lnst_yoy",
-    "nophaitra_vcsh",
-    "vonhoa_tts",
-]
-
-fund_daily = (
-    fundamental.sort_values(["mack", "date"])
-    .set_index("date")
-    .groupby("mack")[fund_features]
-    .resample("D")
-    .ffill()
-    .reset_index()
-)
+# (fund_daily, sent_daily đã có từ Phase 1)
+fund_features = [c for c in FUND_FEATURES if c in fund_daily.columns]
 
 # -------------------------------------------------------------
-# 7. SENTIMENT AGGREGATION (daily) – safe guard if columns missing
+# MERGE ALL DATA (Phase 3 continued)
 # -------------------------------------------------------------
-if "sent_pos" in news.columns:
-    print("Aggregating daily sentiment statistics")
-    sent_daily = (
-        news.groupby(["mack", "date"])
-        .agg(
-            {
-                "sent_pos": ["mean", "std", "max"],
-                "sent_neu": "mean",
-                "sent_neg": ["mean", "std", "max"],
-                "sent_score": ["mean", "std", "min", "max"],
-            }
-        )
-    )
-    sent_daily.columns = ["_".join(c) for c in sent_daily.columns]
-    sent_daily = sent_daily.reset_index()
-    # news count per day
-    news_cnt = news.groupby(["mack", "date"]).size().reset_index(name="news_count")
-    sent_daily = sent_daily.merge(news_cnt, on=["mack", "date"], how="left")
-else:
-    sent_daily = pd.DataFrame()
-    print("⚠️ No sentiment columns – skipping sentiment aggregation.")
-
-# -------------------------------------------------------------
-# 8. MERGE ALL DATA (robust column handling)
-# -------------------------------------------------------------
-print("\n" + "=" * 60)
-print("Merging datasets")
-print("=" * 60)
+print("Merging OHLC + Fundamental + Sentiment...")
 
 # Ensure the key columns exist in each dataframe
 for df, name in [(ohlc, "ohlc"), (fund_daily, "fund_daily"), (sent_daily, "sent_daily")]:
@@ -312,8 +467,11 @@ df = df.dropna(subset=["sector"]).reset_index(drop=True)
 print(f"Sectors used: {df['sector'].nunique()}")
 
 # -------------------------------------------------------------
-# TARGET: Quantile-based binary classification
+# PHASE 4 — TARGET DESIGN (5-day extreme movers 20%-80%)
 # -------------------------------------------------------------
+print("\n" + "=" * 60)
+print("PHASE 4 — TARGET DESIGN")
+print("=" * 60)
 
 df["future_return_5d"] = (
     df.groupby("mack")["close"]
@@ -332,10 +490,18 @@ df["target"] = np.where(
 
 df = df.dropna(subset=["target"]).reset_index(drop=True)
 df["target"] = df["target"].astype(int)
-
+print("Target: binary (1 = return >= 80% quantile, 0 = return <= 20% quantile).")
 
 # -------------------------------------------------------------
-# 12. FEATURE GROUPS
+# PHASE 5 — DATA SPLIT (time-based, inside train_mlp_time_split)
+# PHASE 6 — MODELING (MLP + Baseline)
+# -------------------------------------------------------------
+print("\n" + "=" * 60)
+print("PHASE 5 & 6 — DATA SPLIT & MODELING")
+print("=" * 60)
+
+# -------------------------------------------------------------
+# FEATURE GROUPS
 # -------------------------------------------------------------
 fundamental_features = [c for c in fund_features if c in df.columns]
 
@@ -372,12 +538,14 @@ def train_mlp_time_split(
     feature_cols,
     target_col="target",
     date_col="date",
-    split_date="2023-01-01"
+    split_date=None,
 ):
     """
     Train MLP with proper time-based split, scaling, and optional SMOTE.
     Returns trained model, scaler, predictions, and evaluation metrics.
     """
+    if split_date is None:
+        split_date = SPLIT_DATE
 
     feats = [f for f in feature_cols if f in df.columns]
     if len(feats) < 3:
@@ -416,7 +584,7 @@ def train_mlp_time_split(
             X_train_s, y_train = sm.fit_resample(X_train_s, y_train)
 
     # --------------------
-    # MLP model
+    # MLP model (class_weight for imbalanced targets)
     # --------------------
     model = MLPClassifier(
         hidden_layer_sizes=(256, 128, 64, 32),
@@ -431,7 +599,7 @@ def train_mlp_time_split(
         validation_fraction=0.15,
         n_iter_no_change=20,
         random_state=RANDOM_STATE,
-        verbose=False
+        verbose=False,
     )
 
     model.fit(X_train_s, y_train)
@@ -465,25 +633,47 @@ def train_mlp_time_split(
 
 
 # -------------------------------------------------------------
-# 14. MAIN LOOP – Ablation Study
+# 14. MAIN LOOP – Ablation Study (cache full results for bootstrap/CI)
 # -------------------------------------------------------------
 
 results = []
+results_full = {}  # name -> full train result (model, y_test, y_prob, ...)
 
 for name, feats in feature_groups.items():
     res = train_mlp_time_split(df, feats)
     if res is None:
         continue
-
+    results_full[name] = res
     results.append({
         "Model": name,
         **res["metrics"]
     })
 
+# Baseline (stratified random)
+_feats_all = feature_groups.get("All", [])
+_feats_all = [f for f in _feats_all if f in df.columns]
+if _feats_all and len(_feats_all) >= 3:
+    _data = df[["date"] + _feats_all + ["target"]].dropna()
+    _split_dt = pd.to_datetime(SPLIT_DATE)
+    _train_m = _data["date"] < _split_dt
+    _X_train_b = _data.loc[_train_m, _feats_all].values
+    _y_train_b = _data.loc[_train_m, "target"].values
+    _X_test_b = _data.loc[~_train_m, _feats_all].values
+    _y_test_b = _data.loc[~_train_m, "target"].values
+    _scaler_b = RobustScaler()
+    _X_train_bs = _scaler_b.fit_transform(_X_train_b)
+    _X_test_bs = _scaler_b.transform(_X_test_b)
+    _baseline = DummyClassifier(strategy="stratified", random_state=RANDOM_STATE)
+    _baseline.fit(_X_train_bs, _y_train_b)
+    _y_prob_b = _baseline.predict_proba(_X_test_bs)[:, 1]
+    _auc_b = roc_auc_score(_y_test_b, _y_prob_b)
+    results.append({"Model": "Baseline (stratified)", "Accuracy": accuracy_score(_y_test_b, _baseline.predict(_X_test_bs)), "AUC": _auc_b, "Precision": 0, "Recall": 0, "F1": 0, "AP": 0})
+    print(f"\nBaseline (DummyClassifier stratified) AUC: {_auc_b:.4f}")
+
 results_df = pd.DataFrame(results)
 results_df.to_csv("model_results.csv", index=False)
 
-print("\nAblation Study Results:")
+print("\nAblation Study Results (+ Baseline):")
 print(results_df)
 
 
@@ -522,9 +712,15 @@ def rolling_timeseries_auc_with_plot(df, features, n_splits=5):
         X_test = scaler.transform(X[test_idx])
 
         model = MLPClassifier(
-            hidden_layer_sizes=(256,128,64,32),
-            max_iter=500,
-            random_state=RANDOM_STATE
+            hidden_layer_sizes=(256, 128, 64, 32),
+            activation="relu",
+            solver="adam",
+            alpha=0.001,
+            max_iter=1000,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=20,
+            random_state=RANDOM_STATE,
         )
         model.fit(X_train, y[train_idx])
 
@@ -576,13 +772,20 @@ def permutation_importance_auc(model, X, y, feature_names):
         .sort_values("Importance", ascending=False)
     )
 # -------------------------------------------------------------
-best_row = results_df.sort_values("AUC", ascending=False).iloc[0]
+# Best model (exclude Baseline)
+_results_for_best = results_df[~results_df["Model"].str.contains("Baseline", na=False)]
+best_row = _results_for_best.sort_values("AUC", ascending=False).iloc[0]
 best_model_name = best_row["Model"]
-best_features = feature_groups[best_model_name]
+best_features = feature_groups.get(best_model_name, feature_groups["All"])
 
 print(f"\nBest model selected: {best_model_name}")
 
-best_res = train_mlp_time_split(df, best_features)
+# Reuse cached result to avoid redundant training
+best_res = results_full.get(best_model_name)
+if best_res is None:
+    best_res = train_mlp_time_split(df, best_features)
+    if best_res is not None:
+        results_full[best_model_name] = best_res
 
 
 # -------------------------------------------------------------
@@ -639,10 +842,13 @@ plt.savefig(os.path.join(VIS_DIR, "roc_curve_best_model.png"))
 plt.show()
 
 
-# -------------------------------------------------------------
-# 16.4 SHAP Summary Plot (Best Model)
-# -------------------------------------------------------------
-print("\n📊 16.4 Generating SHAP Analysis...")
+# =============================================================
+# PHASE 8 — INTERPRETATION (SHAP, Sector analysis)
+# =============================================================
+print("\n" + "=" * 60)
+print("PHASE 8 — INTERPRETATION")
+print("=" * 60)
+print("\n📊 Generating SHAP Analysis...")
 
 # Prepare data for SHAP
 X_all = df[best_res["features"]].dropna()
@@ -974,12 +1180,15 @@ mean_auc, ci_lower, ci_upper = bootstrap_ci(
 print(f"\nBest Model ({best_model_name}) AUC with 95% CI:")
 print(f"   AUC = {mean_auc:.4f} [{ci_lower:.4f}, {ci_upper:.4f}]")
 
-# Compute CI for all models
+# Compute CI for all models (reuse cached results to avoid retraining)
 ci_results = []
 for name, feats in feature_groups.items():
-    res = train_mlp_time_split(df, feats)
+    res = results_full.get(name)
     if res is None:
-        continue
+        res = train_mlp_time_split(df, feats)
+        if res is None:
+            continue
+        results_full[name] = res
     mean_auc, ci_lower, ci_upper = bootstrap_ci(
         res["y_test"],
         res["y_prob"]
@@ -1038,8 +1247,12 @@ def paired_cv_comparison(df, features1, features2, n_splits=5):
         X1_train = scaler1.fit_transform(X1[train_idx])
         X1_test = scaler1.transform(X1[test_idx])
         
-        model1 = MLPClassifier(hidden_layer_sizes=(256, 128, 64, 32),
-                               max_iter=500, random_state=RANDOM_STATE)
+        model1 = MLPClassifier(
+            hidden_layer_sizes=(256, 128, 64, 32),
+            activation="relu", solver="adam", alpha=0.001,
+            max_iter=1000, early_stopping=True, validation_fraction=0.15,
+            n_iter_no_change=20, random_state=RANDOM_STATE,
+        )
         model1.fit(X1_train, y[train_idx])
         prob1 = model1.predict_proba(X1_test)[:, 1]
         aucs1.append(roc_auc_score(y[test_idx], prob1))
@@ -1050,8 +1263,12 @@ def paired_cv_comparison(df, features1, features2, n_splits=5):
         X2_train = scaler2.fit_transform(X2[train_idx])
         X2_test = scaler2.transform(X2[test_idx])
         
-        model2 = MLPClassifier(hidden_layer_sizes=(256, 128, 64, 32),
-                               max_iter=500, random_state=RANDOM_STATE)
+        model2 = MLPClassifier(
+            hidden_layer_sizes=(256, 128, 64, 32),
+            activation="relu", solver="adam", alpha=0.001,
+            max_iter=1000, early_stopping=True, validation_fraction=0.15,
+            n_iter_no_change=20, random_state=RANDOM_STATE,
+        )
         model2.fit(X2_train, y[train_idx])
         prob2 = model2.predict_proba(X2_test)[:, 1]
         aucs2.append(roc_auc_score(y[test_idx], prob2))
@@ -1059,8 +1276,24 @@ def paired_cv_comparison(df, features1, features2, n_splits=5):
     return np.array(aucs1), np.array(aucs2)
 
 
-# Compare best model vs others
+# Compare best model vs others (Effect size: 95% CI cho hiệu AUC; Bonferroni)
+def bootstrap_paired_diff_ci(aucs1, aucs2, n_boot=2000, ci=0.95, random_state=42):
+    """Bootstrap 95% CI cho hiệu số (aucs1 - aucs2) — effect size học thuật."""
+    rng = np.random.RandomState(random_state)
+    n = len(aucs1)
+    diffs = np.array(aucs1) - np.array(aucs2)
+    boot_means = []
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, n)
+        boot_means.append(np.mean(diffs[idx]))
+    alpha = (1 - ci) / 2
+    return np.percentile(boot_means, alpha * 100), np.percentile(boot_means, (1 - alpha) * 100)
+
+n_comparisons = sum(1 for k in feature_groups if k != best_model_name)
+alpha_bonferroni = 0.05 / max(n_comparisons, 1)
+
 print(f"\nStatistical comparison: {best_model_name} vs other models")
+print(f"Bonferroni alpha (n={n_comparisons}): {alpha_bonferroni:.4f}")
 print("-" * 60)
 
 stat_results = []
@@ -1079,20 +1312,25 @@ for name, feats in feature_groups.items():
         # Wilcoxon test (two-sided)
         stat, p_value = stats.wilcoxon(aucs_best, aucs_other)
         
-        # Effect size (mean difference)
+        # Effect size: mean difference + 95% CI (bootstrap)
         mean_diff = np.mean(aucs_best - aucs_other)
+        diff_ci_lo, diff_ci_hi = bootstrap_paired_diff_ci(aucs_best, aucs_other)
+        sig_bonferroni = p_value < alpha_bonferroni
         
         stat_results.append({
             "Comparison": f"{best_model_name} vs {name}",
             "Best_Mean": np.mean(aucs_best),
             "Other_Mean": np.mean(aucs_other),
             "Difference": mean_diff,
+            "Diff_CI_Lower": diff_ci_lo,
+            "Diff_CI_Upper": diff_ci_hi,
             "p-value": p_value,
-            "Significant": "Yes" if p_value < 0.05 else "No"
+            "Significant": "Yes" if p_value < 0.05 else "No",
+            "Significant_Bonferroni": "Yes" if sig_bonferroni else "No",
         })
         
         significance = "✓" if p_value < 0.05 else "✗"
-        print(f"{best_model_name} vs {name}: Δ={mean_diff:+.4f}, p={p_value:.4f} {significance}")
+        print(f"{best_model_name} vs {name}: Δ={mean_diff:+.4f} [95% CI: {diff_ci_lo:+.4f}, {diff_ci_hi:+.4f}], p={p_value:.4f} {significance}")
         
     except Exception as e:
         print(f"Could not compare with {name}: {e}")
@@ -1326,3 +1564,8 @@ print(f"""
 """)
 
 print("✅ All analysis completed successfully!")
+
+
+if __name__ == "__main__":
+    # Entry point: toàn bộ pipeline chạy khi gọi trực tiếp file
+    pass  # Code chạy ở top-level phía trên

@@ -1,8 +1,19 @@
-## Mô tả pipeline tổng quan
+## Mô tả pipeline tổng quan (chuẩn luận văn)
 
-Pipeline gồm hai bước chính:
-- `sentiment_analysis.py`: phân tích cảm xúc tin tức tiếng Việt bằng PhoBERT và tạo thêm các biến sentiment ở cấp độ từng tin/ngày/cổ phiếu.
-- `mlp_complete.py`: trộn dữ liệu giá, cơ bản và sentiment; xây dựng các đặc trưng, tạo biến mục tiêu và huấn luyện mô hình MLP để dự đoán xác suất giá cổ phiếu tăng mạnh trong 5 ngày tới.
+**`mlp_complete.py`** — Pipeline hoàn chỉnh 8 phase (chạy một file):
+
+| Phase | Nội dung |
+|-------|----------|
+| **1. Data Preprocessing** | Tiền xử lý OHLC (làm sạch, datetime, sort, drop dup; kiểm tra/xử lý missing, không forward fill giá); Fundamental (quý→ngày, resample daily, ffill; winsorize PE/ROE); News (làm sạch text headline, drop duplicate theo mack/date/title; aggregation daily: mean/sent_score, std/sent_score, max/sent_pos, news_count). *PhoBERT áp dụng trên tiêu đề bài viết.* |
+| **2. Descriptive Statistics** | Thống kê mô tả giá (bảng tổng quan, histogram return 1d/5d, volatility; nhận xét skew/fat-tail); Fundamental (mean PE/ROE, std ROE, phân phối PE); News (tổng quan, news theo DN, histogram news/ngày, news theo năm, phân phối sentiment). |
+| **3. Feature Engineering** | Chỉ báo kỹ thuật (SMA, EMA, RSI, MACD, Bollinger, volume ratio, ret lag, volatility); merge OHLC + Fundamental + Sentiment; xử lý missing; sector. |
+| **4. Target Design** | 5-day extreme movers (20%-80% quantile, binary). |
+| **5. Data Split** | Chia train/test theo thời gian (split_date). |
+| **6. Modeling** | MLP + Baseline (DummyClassifier stratified). Ablation theo nhóm feature. |
+| **7. Evaluation** | AUC, Bootstrap 95% CI, Wilcoxon signed-rank test. |
+| **8. Interpretation** | SHAP, Permutation Importance, phân tích theo sector. |
+
+- **`sentiment_analysis.py`**: chạy trước (một lần) để tạo `news_with_sentiment.csv` từ `news.csv` bằng PhoBERT.
 
 ---
 
@@ -147,6 +158,16 @@ Pipeline gồm hai bước chính:
   - Các đặc trưng **momentum, volatility, một số chỉ tiêu cơ bản và sentiment** được kỳ vọng nằm trong nhóm feature quan trọng nhất theo SHAP và Permutation Importance.  
   - Một số ngành có cấu trúc dòng tiền và tin tức rõ ràng (ví dụ tài chính, ngân hàng, hàng tiêu dùng) được kỳ vọng có **AUC cao hơn mặt bằng chung** trong `sector_results.csv`.  
   - Kết quả cho thấy việc **kết hợp thông tin kỹ thuật + cơ bản + cảm xúc thị trường** giúp mô hình ổn định hơn so với từng nhóm đặc trưng đơn lẻ, dù mức cải thiện có thể vừa phải (synergy nhẹ thay vì nhảy vọt).
+
+---
+
+## Thống kê mô tả (nằm trong mlp_complete.py)
+
+Toàn bộ thống kê mô tả **không tách riêng**: chạy trong **Phase 2** của `mlp_complete.py` (giá OHLC, fundamental, news). Khi chạy `python mlp_complete.py` bạn sẽ có:
+
+- Bảng + histogram giá (return 1d/5d, volatility) → `output/desc_ohlc_overview.csv`, `visualizations/desc_ohlc_hist_*.png`
+- Thống kê fundamental (PE, ROE) + phân phối PE → `visualizations/desc_fund_pe_dist.png`
+- Tổng quan news, news theo doanh nghiệp, histogram news/ngày, news theo năm, phân phối sentiment → `output/news_by_company.csv`, `visualizations/news_histogram_per_day.png`, `news_bar_by_year.png`, `news_sentiment_dist.png`
 
 ---
 
