@@ -1,170 +1,151 @@
-## Mô tả pipeline tổng quan
+# Dự đoán biến động giá cổ phiếu bằng MLP và Sentiment (PhoBERT)
 
-Pipeline gồm hai bước chính:
-- `sentiment_analysis.py`: phân tích cảm xúc tin tức tiếng Việt bằng PhoBERT và tạo thêm các biến sentiment ở cấp độ từng tin/ngày/cổ phiếu.
-- `mlp_complete.py`: trộn dữ liệu giá, cơ bản và sentiment; xây dựng các đặc trưng, tạo biến mục tiêu và huấn luyện mô hình MLP để dự đoán xác suất giá cổ phiếu tăng mạnh trong 5 ngày tới.
+Đề tài sử dụng **Multi-Layer Perceptron (MLP)** kết hợp **chỉ báo kỹ thuật**, **dữ liệu cơ bản** và **sentiment từ tin tức (PhoBERT)** để dự đoán xu hướng lợi suất 5 ngày của cổ phiếu Việt Nam.
 
 ---
 
-## Dữ liệu đầu vào
+## Cấu trúc dự án
 
-- **`data/ohlc.csv`**  
-  - Thông tin giá và khối lượng theo ngày cho từng mã (`mack`, `date`, `open`, `high`, `low`, `close`, `volume`, ...).  
-  - Được dùng để:
-    - Tính **các chỉ báo kỹ thuật**: SMA/EMA nhiều kỳ, RSI, MACD, Bollinger Bands, momentum (các tỷ suất sinh lợi trễ `ret_1d`, `ret_3d`, `ret_5d`, `ret_10d`), volatility 20 ngày, volume ratio,…
-
-- **`data/fundamental.csv`**  
-  - Dữ liệu cơ bản theo quý/năm cho từng mã: `eps`, `roe`, `roa`, `pb`, `pe`, `lnst_yoy`, `nophaitra_vcsh`, `vonhoa_tts`,…  
-  - Được chuyển về **tần suất ngày** bằng cách resample theo ngày và **ffill** trong từng mã, sau đó ghép với dữ liệu giá.
-
-- **`data/news.csv`**  
-  - Tin tức thô theo ngày cho từng mã: `mack`, `date`, `title`,…  
-  - Dùng làm đầu vào cho module sentiment (`sentiment_analysis.py`) để tính điểm cảm xúc cho từng tiêu đề.
-
-- **`data/news_with_sentiment.csv`**  
-  - Nếu chưa tồn tại, sẽ được tạo bởi `sentiment_analysis.py`.  
-  - Bổ sung các cột sentiment ở cấp độ tin:  
-    - `sent_pos`, `sent_neu`, `sent_neg`: xác suất tích cực/trung lập/tiêu cực.  
-    - `sent_score`: điểm liên tục \(= \text{pos} - \text{neg}\).  
-    - `sentiment_label`: nhãn \(-1, 0, 1\) (negative, neutral, positive).  
-  - Trong `mlp_complete.py`, các cột này được **gom theo ngày–mã** để tạo các đặc trưng tổng hợp: mean/std/max của pos/neg, mean/std/min/max của score, `news_count` (số tin trong ngày).
+| Thành phần | Mô tả |
+|------------|--------|
+| **mlp_complete.py** | Pipeline chính: load dữ liệu, tính chỉ báo, gộp fundamental + sentiment, huấn luyện MLP, ablation study, đánh giá và trực quan hóa. |
+| **sentiment_analysis.py** | Chạy **một lần** để tạo file sentiment: dùng PhoBERT (wonrax/phobert-base-vietnamese-sentiment) phân tích sentiment tiếng Việt trên tiêu đề tin → xuất `data/news_with_sentiment.csv`. |
+| **data/** | `ohlc.csv`, `fundamental.csv`, `news.csv`. Sau khi chạy sentiment: `news_with_sentiment.csv`. |
+| **visualizations/** | Các biểu đồ: ablation AUC, ROC, confusion matrix, SHAP, learning curve, sector performance, bootstrap CI, v.v. |
+| **model_results.csv** | Kết quả ablation (Accuracy, AUC, F1, …) theo từng nhóm feature. |
 
 ---
 
-## Các mô hình / phương pháp luận sử dụng
+## Cách chạy
 
-- **Phân tích cảm xúc (Sentiment Analysis – `sentiment_analysis.py`)**
-  - Mô hình **PhoBERT**:
-    - Tokenizer: `vinai/phobert-base`.
-    - Mô hình phân loại sentiment: `wonrax/phobert-base-vietnamese-sentiment`.
-  - Xử lý theo **mini-batch** trên GPU (nếu có), sử dụng softmax để lấy xác suất cho 3 lớp: positive, neutral, negative.
-  - Tính các biến:
-    - Xác suất từng lớp: `sent_pos`, `sent_neu`, `sent_neg`.
-    - Điểm sentiment liên tục: `sent_score = sent_pos - sent_neg`.
-    - Nhãn sentiment rời rạc: {-1, 0, 1} dựa trên argmax xác suất.
-  - Đồng thời sinh **biểu đồ phân phối sentiment** và lưu vào thư mục `visualizations/`.
+1. **Chuẩn bị dữ liệu**  
+   Đặt `ohlc.csv`, `fundamental.csv`, `news.csv` trong thư mục `data/`.
 
-- **Xây dựng đặc trưng kỹ thuật, cơ bản, sentiment (`mlp_complete.py`)**
-  - **Technical features**: SMA, EMA, RSI, MACD (+ signal, histogram), Bollinger Bands, volume ratio, các tỷ suất sinh lợi trễ, volatility 20 ngày,…
-  - **Fundamental features**: bộ chỉ số EPS, ROE, ROA, P/E, P/B, tăng trưởng lợi nhuận, cấu trúc vốn,… được nội suy theo ngày và ghép với OHLC.
-  - **Sentiment features**: thống kê theo ngày–mã của `sent_pos`, `sent_neu`, `sent_neg`, `sent_score`, `news_count`.
-  - Xử lý missing:
-    - Ffill theo từng mã cho fundamental & sentiment.
-    - Điền giá trị trung tính cho một số biến sentiment (ví dụ score = 0, pos/neg ≈ 0.33 nếu thiếu).
+2. **Tạo sentiment (chạy một lần)**  
+   ```bash
+   python sentiment_analysis.py
+   ```  
+   Cần: `torch`, `transformers`, `tqdm`. Nếu đã có `data/news_with_sentiment.csv` thì script sẽ bỏ qua inference và chỉ vẽ biểu đồ phân bố sentiment.
 
-- **Mô hình chính: Multi-Layer Perceptron (MLP)**
-  - Kiến trúc mặc định: **4 tầng ẩn** `(256, 128, 64, 32)`, activation ReLU, optimizer Adam, learning rate adaptive, early stopping.  
-  - Input là các tập feature khác nhau (ablation study): Fundamental, Technical, Sentiment, Fund+Tech, Fund+Sent, Tech+Sent, All.
-  - Chuẩn hóa input bằng **RobustScaler** chỉ trên tập train.
-  - Với dữ liệu mất cân bằng, áp dụng **SMOTE** (nếu `imbalanced-learn` có sẵn) trên tập train.
+3. **Chạy pipeline MLP**  
+   ```bash
+   python mlp_complete.py
+   ```  
+   Cần: `pandas`, `numpy`, `scikit-learn`, `matplotlib`, `seaborn`, `shap`, `scipy`. Tùy chọn: `imbalanced-learn` (SMOTE).
 
-- **Phân tích chuyên sâu & kiểm định học thuật**
-  - **TimeSeriesSplit**: đánh giá AUC theo từng fold thời gian (rolling).  
-  - **SHAP (KernelExplainer)**: phân tích độ quan trọng đặc trưng cho mô hình tốt nhất.  
-  - **Permutation Importance (AUC-based)**: đo mức giảm AUC khi xáo trộn từng đặc trưng.  
-  - **Phân tích theo ngành**: huấn luyện lại mô hình tốt nhất riêng cho từng sector (dựa trên mapping `mack → sector`).  
-  - **Bootstrap CI & Wilcoxon signed-rank test**:  
-    - Bootstrap ước lượng khoảng tin cậy 95% cho AUC.  
-    - Wilcoxon so sánh có ghép cặp AUC giữa mô hình tốt nhất và các cấu hình feature khác.
+4. **Chạy tất cả (Windows)**  
+   ```bash
+   run_all.bat
+   ```
 
 ---
 
-## Biến mục tiêu
+## Tóm tắt hai file chính
 
-- Biến mục tiêu được định nghĩa trong `mlp_complete.py` như sau:
-  - Tính **tỷ suất sinh lợi tương lai 5 ngày** cho mỗi dòng dữ liệu:
-    - `future_return_5d = pct_change(5).shift(-5)` trên cột `close` theo từng mã.
-  - Lấy **phân vị 20% và 80%** của phân phối `future_return_5d` trên toàn bộ tập dữ liệu:
-    - `q_low = quantile(0.2)` – ngưỡng “giảm mạnh”.
-    - `q_high = quantile(0.8)` – ngưỡng “tăng mạnh”.
-  - Ánh xạ thành **bài toán phân loại nhị phân**:
-    - `target = 1` nếu `future_return_5d ≥ q_high` (có khả năng tăng mạnh trong 5 ngày tới).  
-    - `target = 0` nếu `future_return_5d ≤ q_low` (có khả năng giảm mạnh).  
-    - Các quan sát ở giữa bị loại bỏ (`NaN` → drop).
-  - Sau xử lý, `target` là biến nhị phân (`int`) dùng để huấn luyện MLP.
+### 1. sentiment_analysis.py
 
----
+- **Input:** `data/news.csv` (cột `title`, `date`, `mack`).
+- **Xử lý:** Tokenize bằng PhoBERT, inference batch (GPU/CPU), softmax → xác suất positive / neutral / negative.
+- **Output:** `data/news_with_sentiment.csv` với các cột: `sent_pos`, `sent_neu`, `sent_neg`, `sent_score` (= pos − neg), `sentiment_label` ∈ {−1, 0, 1}.
+- **Lưu ý:** Chỉ phân tích **toàn bộ** tin (không loại 40% dữ liệu); cache bằng cách kiểm tra tồn tại file output.
 
-## Cách đánh giá mô hình
+### 2. mlp_complete.py
 
-- **Chia tập train/test theo thời gian**  
-  - Cắt theo mốc `split_date = "2023-01-01"`: dữ liệu trước ngày này để train, sau/ngày này để test.  
-  - Đảm bảo không rò rỉ thông tin tương lai (time leakage).
-
-- **Các thước đo chính trên tập test**
-  - **Accuracy**: tỷ lệ dự đoán đúng nhị phân.  
-  - **AUC (ROC AUC)**: diện tích dưới đường cong ROC, đo quality của xác suất dự đoán.  
-  - **Precision, Recall, F1**: đánh giá cân bằng giữa việc bắt được các trường hợp tăng mạnh và tránh báo động giả.  
-  - **Average Precision (AP)**: diện tích dưới đường cong Precision–Recall.
-
-- **Thí nghiệm ablation (so sánh tổ hợp đặc trưng)**
-  - Chạy `train_mlp_time_split` cho từng nhóm feature: Fundamental, Technical, Sentiment, Fund+Tech, Fund+Sent, Tech+Sent, All.  
-  - Lưu kết quả vào `model_results.csv` và vẽ biểu đồ `ablation_auc_bar.png`, `radar_metrics.png`, `feature_combination_comparison.png`.
-
-- **Đánh giá ổn định theo thời gian và thống kê**
-  - **Rolling TimeSeriesSplit AUC** (`rolling_auc.png`): AUC theo từng fold thời gian để xem tính ổn định.  
-  - **Bootstrap CI** (`auc_confidence_intervals.png`): khoảng tin cậy 95% cho AUC từng mô hình.  
-  - **Wilcoxon signed-rank test** (`statistical_comparison.png`, `statistical_tests.csv`): xác định chênh lệch giữa mô hình tốt nhất và các mô hình khác có **ý nghĩa thống kê** hay không (p-value < 0.05).
-
-- **Phân tích diễn giải mô hình**
-  - **Confusion Matrix** (`confusion_matrix.png`): phân tích lỗi dự đoán.  
-  - **ROC Curve, Precision–Recall Curve** (`roc_curve_best_model.png`, `precision_recall_curve.png`).  
-  - **SHAP & Permutation Importance** (`shap_summary.png`, `permutation_importance.png`): xác định đặc trưng nào đóng góp nhiều nhất vào quyết định của mô hình.
+- **Dữ liệu:** Merge OHLC (sau khi thêm chỉ báo kỹ thuật), fundamental (resample theo ngày, ffill), sentiment (aggregate theo mack + date: mean/std/max của sent_*, news_count).
+- **Chỉ báo kỹ thuật:** SMA/EMA (5,10,20,50), RSI, MACD, Bollinger Bands, volume_ratio, return lag 1/3/5/10 ngày, volatility_20d.
+- **Target:** Cấu hình trong `mlp_complete.py`:
+  - **price** (mặc định, theo nghiên cứu): **(1) Hồi quy** – Mô hình dự báo **giá ngày mai** P_pred. **(2) So sánh** – So sánh P_pred với giá hôm nay P_today. **(3) Tín hiệu** – Nếu P_pred > P_today (hoặc tăng > `SIGNAL_THRESHOLD_PCT`, ví dụ 2%) → tín hiệu **Mua (1)**. Lợi ích: *độ chi tiết* (biên độ lợi nhuận), *linh hoạt* (đổi ngưỡng mua/bán không cần train lại). Đánh giá: R², RMSE, MAE trên giá + Accuracy của tín hiệu Mua/Bán.
+  - **direction:** Target -1/0/1 theo hướng biến động, regression dự đoán số thực, R²/RMSE/MAE.
+  - **quantile** / **binary** / **fixed_pct:** classification 0/1 (AUC, F1, …).
+- **Huấn luyện:** Time-based split (train trước 2023-01-01, test sau), RobustScaler, tùy chọn SMOTE, MLP (256-128-64-32, early stopping).
+- **Ablation:** So sánh Fundamental, Technical, Sentiment, Fund+Tech, Fund+Sent, Tech+Sent, All.
+- **Đánh giá:** Accuracy, AUC, Precision, Recall, F1, AP; ROC, PR curve, confusion matrix; SHAP, permutation importance; bootstrap CI; Wilcoxon test; phân tích theo sector.
 
 ---
 
-## Kết quả trả ra
+## Đánh giá: Đề tài đã hiệu quả chưa?
 
-- **File dữ liệu và báo cáo**
-  - `data/news_with_sentiment.csv`: tin tức đã được gán sentiment cho từng tiêu đề.  
-  - `model_results.csv`: bảng tổng hợp Accuracy, AUC, Precision, Recall, F1, AP cho từng tổ hợp feature.  
-  - `sector_results.csv`: hiệu suất (AUC, Accuracy, F1) của mô hình tốt nhất trên từng ngành.  
-  - `statistical_tests.csv`: kết quả kiểm định Wilcoxon giữa mô hình tốt nhất và các mô hình khác.  
-  - `feature_combination_analysis.csv`: bảng xếp hạng và phân tích chi tiết ablation study.
+### Kết quả hiện tại (từ model_results.csv)
 
-- **Biểu đồ / hình ảnh trong thư mục `visualizations/`** (được sinh khi chạy code)
-  - `sentiment_distribution.png`: phân phối nhãn và điểm sentiment từ PhoBERT.  
-  - `ablation_auc_bar.png`, `feature_combination_comparison.png`, `radar_metrics.png`: so sánh hiệu suất các nhóm feature.  
-  - `rolling_auc.png`: AUC theo từng fold thời gian.  
-  - `precision_recall_curve.png`, `roc_curve_best_model.png`, `confusion_matrix.png`: đánh giá chi tiết mô hình tốt nhất.  
-  - `permutation_importance.png`, `shap_summary.png`: độ quan trọng đặc trưng.  
-  - `feature_correlation.png`: ma trận tương quan giữa các đặc trưng.  
-  - `sector_performance.png`: hiệu suất theo ngành.  
-  - `auc_confidence_intervals.png`, `statistical_comparison.png`: kết quả bootstrap CI và kiểm định thống kê.  
-  - `learning_curve.png`: đường cong hội tụ loss của MLP.
+| Model      | Accuracy | AUC   | F1    |
+|-----------|----------|-------|--------|
+| Technical | ~0.522   | ~0.525| ~0.522 |
+| Fundamental | ~0.514 | ~0.517| ~0.509 |
+| Fund+Tech | ~0.509   | ~0.511| ~0.476 |
+| Tech+Sent | ~0.515   | ~0.516| ~0.497 |
+| All       | ~0.511   | ~0.509| ~0.433 |
+| Sentiment | ~0.511   | ~0.500| ~0.225 |
 
----
+**Nhận xét ngắn gọn:**
 
-## Kết quả kỳ vọng
+- **AUC quanh 0.50–0.52** → sức dự báo **rất yếu**, gần với đoán ngẫu nhiên (0.5). Trong bối cảnh học máy tài chính, AUC > 0.55 thường mới được xem là có tín hiệu nhẹ.
+- **Technical** đang tốt nhất trong các cấu hình; **Sentiment** đơn lẻ gần random và F1 rất thấp (lệch lớp / tín hiệu yếu).
+- **All** (đủ feature) không tốt hơn Technical, thậm chí thấp hơn → gợi ý **nhiễu hoặc overfitting** khi thêm fundamental + sentiment với cách dùng hiện tại.
 
-- **Về mặt định lượng**
-  - Mô hình tốt nhất (thường là nhóm feature kết hợp, ví dụ `All` hoặc `Tech+Sent`) được kỳ vọng đạt **AUC cao hơn đáng kể mức ngẫu nhiên 0.5**, nằm trong khoảng **0.55–0.65** tùy chất lượng dữ liệu.  
-  - Accuracy và F1 ở mức trên 0.55–0.60, thể hiện khả năng nhận diện các phiên “tăng mạnh” tốt hơn đoán ngẫu nhiên.  
-  - Bootstrap CI cho AUC **không cắt qua 0.5** đối với mô hình tốt nhất, cho thấy tín hiệu dự báo có ý nghĩa.  
-  - Các kiểm định Wilcoxon cho thấy mô hình tốt nhất có **p-value < 0.05** khi so với một số cấu hình kém hơn, chứng minh cải thiện có ý nghĩa thống kê.
-
-- **Về mặt định tính / diễn giải**
-  - Các đặc trưng **momentum, volatility, một số chỉ tiêu cơ bản và sentiment** được kỳ vọng nằm trong nhóm feature quan trọng nhất theo SHAP và Permutation Importance.  
-  - Một số ngành có cấu trúc dòng tiền và tin tức rõ ràng (ví dụ tài chính, ngân hàng, hàng tiêu dùng) được kỳ vọng có **AUC cao hơn mặt bằng chung** trong `sector_results.csv`.  
-  - Kết quả cho thấy việc **kết hợp thông tin kỹ thuật + cơ bản + cảm xúc thị trường** giúp mô hình ổn định hơn so với từng nhóm đặc trưng đơn lẻ, dù mức cải thiện có thể vừa phải (synergy nhẹ thay vì nhảy vọt).
+**Kết luận:** Đề tài **đã có pipeline đầy đủ, đúng hướng** (dữ liệu, kỹ thuật, fundamental, sentiment, ablation, đánh giá thống kê), nhưng **chưa đạt mức “hiệu quả” về mặt dự báo** (AUC vẫn gần random). Cần chỉnh target, feature, horizon và mô hình thì mới có cơ hội cải thiện rõ rệt.
 
 ---
 
-## Cách chạy nhanh
+## Nếu kết quả chạy ra không đẹp thì nên làm gì?
 
-- Cài đặt thư viện (môi trường Python 3.x):
-```bash
-pip install numpy pandas matplotlib seaborn scikit-learn shap imbalanced-learn
-pip install torch transformers tqdm
-```
+### 1. Chỉnh cách tạo target và lượng dữ liệu
 
-- Chạy lần lượt hai bước chính:
-```bash
-# 1. Tạo cache sentiment (chỉ cần chạy lại khi thay đổi news.csv)
-python sentiment_analysis.py
+- Đang dùng quantile (ví dụ 0.3/0.7) thì **chỉ giữ 60%** mẫu; 40% ở giữa bị bỏ → mất thông tin.
+- **Thử:** `TARGET_MODE = "binary"` với `TARGET_FIXED_THRESHOLD_PCT = 0` hoặc `0.005` để dùng **gần 100%** dữ liệu, lớp cân bằng hơn (có thể kết hợp SMOTE hoặc class_weight nếu dùng mô hình hỗ trợ).
+- Hoặc **regression**: dự báo `future_return_5d` liên tục thay vì phân lớp; đánh giá bằng RMSE, MAE, correlation với thực tế.
 
-# 2. Huấn luyện và đánh giá mô hình MLP
-python mlp_complete.py
-```
+### 2. Horizon ngắn hơn
 
-*(Bạn cũng có thể sử dụng `run_all.bat` nếu đã cấu hình sẵn trên Windows.)*
+- **5 ngày** có thể quá xa, tín hiệu bị nhiễu.
+- **Thử:** target 1 ngày (`future_return_1d`) để dễ học hơn (có thể sau đó mở rộng lại 3/5 ngày).
+
+### 3. Feature và sentiment
+
+- **Sentiment:** Thêm **lag** (sent_score lag 1–5 ngày), **rolling mean** sentiment theo 3/5 ngày; hoặc tương tác **sector × sentiment**.
+- **Aggregation:** Trong `mlp_complete.py` đã gộp sentiment theo ngày; có thể thử cửa sổ 3 ngày, 5 ngày (rolling) thay vì chỉ theo ngày.
+- **Fundamental:** Kiểm tra missing, outlier; có thể chỉ giữ vài chỉ số quan trọng (PE, ROE, …) để giảm nhiễu.
+
+### 4. Train/test và validation
+
+- Giữ **time-based split** (không shuffle theo thời gian).
+- **Thử expanding window:** train từ đầu đến tăng dần, test trên từng đoạn sau; hoặc TimeSeriesSplit với nhiều fold để ước lượng AUC ổn định hơn.
+
+### 5. Mô hình
+
+- **Grid search** MLP: `hidden_layer_sizes`, `alpha`, `learning_rate_init`, `batch_size`.
+- Nếu chuyển sang **PyTorch/Keras**: thêm dropout, batch norm để giảm overfitting.
+- So sánh với **baseline đơn giản** (logistic regression, Random Forest) để biết MLP có thực sự đóng góp hay không.
+
+### 6. Đánh giá thực tế
+
+- **Backtest đơn giản:** Nhóm mẫu theo dự báo (ví dụ prob > 0.5 vs ≤ 0.5), so sánh **average return** thực tế giữa hai nhóm; nếu nhóm “dự báo tăng” có return trung bình cao hơn rõ rệt thì mới có giá trị thực tế.
+- Đã có **phân tích theo sector**; có thể báo cáo rõ sector nào model hoạt động tương đối tốt / kém.
+
+---
+
+## Đề xuất các hướng đi tiếp theo
+
+| Hướng | Nội dung |
+|-------|----------|
+| **1. Target & dữ liệu** | Chuyển sang binary với threshold nhỏ hoặc regression; tăng phần dữ liệu dùng (60% → 100%) và so sánh AUC/F1. |
+| **2. Horizon** | So sánh target 1d vs 3d vs 5d; có thể báo cáo “model có tín hiệu tốt hơn ở horizon ngắn”. |
+| **3. Sentiment nâng cao** | Lag + rolling sentiment; thêm feature tương tác sector–sentiment; có thể thử model sentiment khác (hoặc ensemble) nếu có dữ liệu nhãn. |
+| **4. Feature selection** | Dùng permutation importance / SHAP (đã có) để bỏ bớt feature nhiễu; huấn luyện lại chỉ với top-k feature. |
+| **5. So sánh mô hình** | Thêm Logistic Regression, Random Forest, XGBoost; so sánh AUC và thời gian huấn luyện; giải thích tại sao chọn MLP (hoặc chuyển sang mô hình tốt hơn). |
+| **6. Backtest & ứng dụng** | Viết script backtest đơn giản (theo signal mua/bán hoặc theo xác suất); báo cáo Sharpe ratio hoặc lợi nhuận giả định so với buy-and-hold. |
+| **7. Phân tích sector** | Viết phần “kết luận” ngắn: sector nào AUC cao/thấp, có phù hợp với đặc điểm ngành (ví dụ ngân hàng nhạy tin tức hơn). |
+| **8. Cải thiện kỹ thuật** | Thêm chỉ báo (ADX, ATR, …) hoặc giảm đa cộng tuyến (loại bỏ feature tương quan quá cao); chuẩn hóa/scale nhất quán. |
+
+---
+
+## Tài liệu thêm
+
+- **IMPROVEMENT_PROPOSALS.md** – Đề xuất cải thiện chi tiết (target mode, class balance, horizon, feature, model).
+- **model_results.csv** – Kết quả ablation hiện tại.
+- **sector_results.csv** – Hiệu năng theo sector (sau khi chạy mlp_complete.py).
+
+---
+
+## Tóm tắt một dòng
+
+**Đề tài:** Dự đoán xu hướng lợi suất 5 ngày bằng MLP + technical + fundamental + sentiment (PhoBERT). **Hiện trạng:** Pipeline đầy đủ, nhưng AUC ~0.51 (gần random). **Hướng đi:** Chỉnh target (binary/regression), tăng dữ liệu dùng, thử horizon 1d, cải thiện feature sentiment, so sánh mô hình và backtest đơn giản để đánh giá giá trị thực tế.
