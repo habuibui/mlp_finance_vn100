@@ -5,6 +5,10 @@
 Phân tích sentiment tin tức bằng PhoBERT.
 Đầu vào: cột title (hoặc text). Đầu ra: sent_pos, sent_neu, sent_neg, sent_score.
 Dùng cho pipeline dự đoán giá cổ phiếu (mlp_complete.py).
+
+Pipeline gợi ý:
+  1. Chạy sentiment_analysis.py (--recompute nếu cần) → data/news_with_sentiment.csv
+  2. Chạy mlp_complete.py: target 30/70 quantile, train 70% / test 30%, AUC & accuracy.
 """
 
 import os
@@ -169,6 +173,49 @@ def plot_sentiment_distribution(news: pd.DataFrame, vis_dir: str) -> None:
     print(f"✓ Saved: {out_path}")
 
 
+def news_stats_table(news: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tạo bảng thống kê tin tức: tổng số news, số news theo từng doanh nghiệp (mack).
+    Trả về DataFrame với cột [mack, news_count], có thêm dòng tổng (mack = 'TỔNG').
+    """
+    if "mack" not in news.columns:
+        total = len(news)
+        return pd.DataFrame({"mack": ["TỔNG"], "news_count": [total]})
+
+    per_mack = (
+        news.groupby("mack", as_index=False).size().rename(columns={"size": "news_count"})
+    )
+    total_row = pd.DataFrame({"mack": ["TỔNG"], "news_count": [per_mack["news_count"].sum()]})
+    return pd.concat([per_mack, total_row], ignore_index=True)
+
+
+def print_and_save_news_stats(news: pd.DataFrame, vis_dir: str) -> None:
+    """In và lưu bảng thống kê tin tức (tổng news, news theo từng doanh nghiệp)."""
+    stats = news_stats_table(news)
+    os.makedirs(vis_dir, exist_ok=True)
+
+    total_news = int(stats.loc[stats["mack"] == "TỔNG", "news_count"].iloc[0])
+    n_companies = len(stats) - 1
+
+    print("\n" + "=" * 60)
+    print("THỐNG KÊ TIN TỨC (NEWS)")
+    print("=" * 60)
+    print(f"  Tổng số tin (news): {total_news:,}")
+    print(f"  Số doanh nghiệp (mack): {n_companies}")
+    print("\n  Bảng số tin theo doanh nghiệp (mack) — sắp xếp giảm dần:")
+    print("-" * 60)
+    # Bảng đầy đủ: từng mack (sort giảm dần) + dòng TỔNG ở cuối
+    tbl = stats[stats["mack"] != "TỔNG"].sort_values("news_count", ascending=False)
+    tbl_display = pd.concat([tbl, stats[stats["mack"] == "TỔNG"]], ignore_index=True)
+    print(tbl_display.to_string(index=False))
+    print("-" * 60)
+    # Lưu file CSV
+    os.makedirs(SentimentConfig.DATA_DIR, exist_ok=True)
+    out_csv = os.path.join(SentimentConfig.DATA_DIR, "news_stats.csv")
+    stats.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"\n✓ Đã lưu bảng thống kê: {out_csv}")
+
+
 def print_summary(news: pd.DataFrame) -> None:
     """In tóm tắt thống kê sentiment."""
     print("\n" + "=" * 50)
@@ -209,6 +256,7 @@ def run_sentiment_analysis(
         news = pd.read_csv(cfg.OUTPUT_FILE)
         if "sent_score" in news.columns:
             plot_sentiment_distribution(news, cfg.VIS_DIR)
+        print_and_save_news_stats(news, cfg.VIS_DIR)
         return news
 
     device = get_device()
@@ -241,6 +289,7 @@ def run_sentiment_analysis(
 
     print("✓ Sentiment analysis completed!")
     print_summary(news)
+    print_and_save_news_stats(news, cfg.VIS_DIR)
     return news
 
 
