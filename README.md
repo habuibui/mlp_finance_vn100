@@ -1,191 +1,146 @@
-## Mô tả pipeline tổng quan (chuẩn luận văn)
+# Dự đoán biến động giá cổ phiếu bằng MLP và Sentiment
 
-**`mlp_complete.py`** — Pipeline hoàn chỉnh 8 phase (chạy một file):
-
-| Phase | Nội dung |
-|-------|----------|
-| **1. Data Preprocessing** | Tiền xử lý OHLC (làm sạch, datetime, sort, drop dup; kiểm tra/xử lý missing, không forward fill giá); Fundamental (quý→ngày, resample daily, ffill; winsorize PE/ROE); News (làm sạch text headline, drop duplicate theo mack/date/title; aggregation daily: mean/sent_score, std/sent_score, max/sent_pos, news_count). *PhoBERT áp dụng trên tiêu đề bài viết.* |
-| **2. Descriptive Statistics** | Thống kê mô tả giá (bảng tổng quan, histogram return 1d/5d, volatility; nhận xét skew/fat-tail); Fundamental (mean PE/ROE, std ROE, phân phối PE); News (tổng quan, news theo DN, histogram news/ngày, news theo năm, phân phối sentiment). |
-| **3. Feature Engineering** | Chỉ báo kỹ thuật (SMA, EMA, RSI, MACD, Bollinger, volume ratio, ret lag, volatility); merge OHLC + Fundamental + Sentiment; xử lý missing; sector. |
-| **4. Target Design** | 5-day extreme movers (20%-80% quantile, binary). |
-| **5. Data Split** | Chia train/test theo thời gian (split_date). |
-| **6. Modeling** | MLP + Baseline (DummyClassifier stratified). Ablation theo nhóm feature. |
-| **7. Evaluation** | AUC, Bootstrap 95% CI, Wilcoxon signed-rank test. |
-| **8. Interpretation** | SHAP, Permutation Importance, phân tích theo sector. |
-
-- **`sentiment_analysis.py`**: chạy trước (một lần) để tạo `news_with_sentiment.csv` từ `news.csv` bằng PhoBERT.
+Pipeline học máy dự đoán xu hướng giá cổ phiếu (lên/xuống) dựa trên chỉ báo kỹ thuật, dữ liệu cơ bản và sentiment tin tức (PhoBERT).
 
 ---
 
-## Dữ liệu đầu vào
+## Yêu cầu
 
-- **`data/ohlc.csv`**  
-  - Thông tin giá và khối lượng theo ngày cho từng mã (`mack`, `date`, `open`, `high`, `low`, `close`, `volume`, ...).  
-  - Được dùng để:
-    - Tính **các chỉ báo kỹ thuật**: SMA/EMA nhiều kỳ, RSI, MACD, Bollinger Bands, momentum (các tỷ suất sinh lợi trễ `ret_1d`, `ret_3d`, `ret_5d`, `ret_10d`), volatility 20 ngày, volume ratio,…
+- **Python 3.8+**
+- Các thư viện chính: `pandas`, `numpy`, `scikit-learn`, `matplotlib`, `seaborn`, `shap`, `scipy`
+- Cho sentiment: `torch`, `transformers`, `tqdm`
+- Tùy chọn: `imbalanced-learn` (SMOTE)
 
-- **`data/fundamental.csv`**  
-  - Dữ liệu cơ bản theo quý/năm cho từng mã: `eps`, `roe`, `roa`, `pb`, `pe`, `lnst_yoy`, `nophaitra_vcsh`, `vonhoa_tts`,…  
-  - Được chuyển về **tần suất ngày** bằng cách resample theo ngày và **ffill** trong từng mã, sau đó ghép với dữ liệu giá.
+Cài đặt ví dụ:
 
-- **`data/news.csv`**  
-  - Tin tức thô theo ngày cho từng mã: `mack`, `date`, `title`,…  
-  - Dùng làm đầu vào cho module sentiment (`sentiment_analysis.py`) để tính điểm cảm xúc cho từng tiêu đề.
-
-- **`data/news_with_sentiment.csv`**  
-  - Nếu chưa tồn tại, sẽ được tạo bởi `sentiment_analysis.py`.  
-  - Bổ sung các cột sentiment ở cấp độ tin:  
-    - `sent_pos`, `sent_neu`, `sent_neg`: xác suất tích cực/trung lập/tiêu cực.  
-    - `sent_score`: điểm liên tục \(= \text{pos} - \text{neg}\).  
-    - `sentiment_label`: nhãn \(-1, 0, 1\) (negative, neutral, positive).  
-  - Trong `mlp_complete.py`, các cột này được **gom theo ngày–mã** để tạo các đặc trưng tổng hợp: mean/std/max của pos/neg, mean/std/min/max của score, `news_count` (số tin trong ngày).
-
----
-
-## Các mô hình / phương pháp luận sử dụng
-
-- **Phân tích cảm xúc (Sentiment Analysis – `sentiment_analysis.py`)**
-  - Mô hình **PhoBERT**:
-    - Tokenizer: `vinai/phobert-base`.
-    - Mô hình phân loại sentiment: `wonrax/phobert-base-vietnamese-sentiment`.
-  - Xử lý theo **mini-batch** trên GPU (nếu có), sử dụng softmax để lấy xác suất cho 3 lớp: positive, neutral, negative.
-  - Tính các biến:
-    - Xác suất từng lớp: `sent_pos`, `sent_neu`, `sent_neg`.
-    - Điểm sentiment liên tục: `sent_score = sent_pos - sent_neg`.
-    - Nhãn sentiment rời rạc: {-1, 0, 1} dựa trên argmax xác suất.
-  - Đồng thời sinh **biểu đồ phân phối sentiment** và lưu vào thư mục `visualizations/`.
-
-- **Xây dựng đặc trưng kỹ thuật, cơ bản, sentiment (`mlp_complete.py`)**
-  - **Technical features**: SMA, EMA, RSI, MACD (+ signal, histogram), Bollinger Bands, volume ratio, các tỷ suất sinh lợi trễ, volatility 20 ngày,…
-  - **Fundamental features**: bộ chỉ số EPS, ROE, ROA, P/E, P/B, tăng trưởng lợi nhuận, cấu trúc vốn,… được nội suy theo ngày và ghép với OHLC.
-  - **Sentiment features**: thống kê theo ngày–mã của `sent_pos`, `sent_neu`, `sent_neg`, `sent_score`, `news_count`.
-  - Xử lý missing:
-    - Ffill theo từng mã cho fundamental & sentiment.
-    - Điền giá trị trung tính cho một số biến sentiment (ví dụ score = 0, pos/neg ≈ 0.33 nếu thiếu).
-
-- **Mô hình chính: Multi-Layer Perceptron (MLP)**
-  - Kiến trúc mặc định: **4 tầng ẩn** `(256, 128, 64, 32)`, activation ReLU, optimizer Adam, learning rate adaptive, early stopping.  
-  - Input là các tập feature khác nhau (ablation study): Fundamental, Technical, Sentiment, Fund+Tech, Fund+Sent, Tech+Sent, All.
-  - Chuẩn hóa input bằng **RobustScaler** chỉ trên tập train.
-  - Với dữ liệu mất cân bằng, áp dụng **SMOTE** (nếu `imbalanced-learn` có sẵn) trên tập train.
-
-- **Phân tích chuyên sâu & kiểm định học thuật**
-  - **TimeSeriesSplit**: đánh giá AUC theo từng fold thời gian (rolling).  
-  - **SHAP (KernelExplainer)**: phân tích độ quan trọng đặc trưng cho mô hình tốt nhất.  
-  - **Permutation Importance (AUC-based)**: đo mức giảm AUC khi xáo trộn từng đặc trưng.  
-  - **Phân tích theo ngành**: huấn luyện lại mô hình tốt nhất riêng cho từng sector (dựa trên mapping `mack → sector`).  
-  - **Bootstrap CI & Wilcoxon signed-rank test**:  
-    - Bootstrap ước lượng khoảng tin cậy 95% cho AUC.  
-    - Wilcoxon so sánh có ghép cặp AUC giữa mô hình tốt nhất và các cấu hình feature khác.
-
----
-
-## Biến mục tiêu
-
-- Biến mục tiêu được định nghĩa trong `mlp_complete.py` như sau:
-  - Tính **tỷ suất sinh lợi tương lai 5 ngày** cho mỗi dòng dữ liệu:
-    - `future_return_5d = pct_change(5).shift(-5)` trên cột `close` theo từng mã.
-  - Lấy **phân vị 20% và 80%** của phân phối `future_return_5d` trên toàn bộ tập dữ liệu:
-    - `q_low = quantile(0.2)` – ngưỡng “giảm mạnh”.
-    - `q_high = quantile(0.8)` – ngưỡng “tăng mạnh”.
-  - Ánh xạ thành **bài toán phân loại nhị phân**:
-    - `target = 1` nếu `future_return_5d ≥ q_high` (có khả năng tăng mạnh trong 5 ngày tới).  
-    - `target = 0` nếu `future_return_5d ≤ q_low` (có khả năng giảm mạnh).  
-    - Các quan sát ở giữa bị loại bỏ (`NaN` → drop).
-  - Sau xử lý, `target` là biến nhị phân (`int`) dùng để huấn luyện MLP.
-
----
-
-## Cách đánh giá mô hình
-
-- **Chia tập train/test theo thời gian**  
-  - Cắt theo mốc `split_date = "2023-01-01"`: dữ liệu trước ngày này để train, sau/ngày này để test.  
-  - Đảm bảo không rò rỉ thông tin tương lai (time leakage).
-
-- **Các thước đo chính trên tập test**
-  - **Accuracy**: tỷ lệ dự đoán đúng nhị phân.  
-  - **AUC (ROC AUC)**: diện tích dưới đường cong ROC, đo quality của xác suất dự đoán.  
-  - **Precision, Recall, F1**: đánh giá cân bằng giữa việc bắt được các trường hợp tăng mạnh và tránh báo động giả.  
-  - **Average Precision (AP)**: diện tích dưới đường cong Precision–Recall.
-
-- **Thí nghiệm ablation (so sánh tổ hợp đặc trưng)**
-  - Chạy `train_mlp_time_split` cho từng nhóm feature: Fundamental, Technical, Sentiment, Fund+Tech, Fund+Sent, Tech+Sent, All.  
-  - Lưu kết quả vào `model_results.csv` và vẽ biểu đồ `ablation_auc_bar.png`, `radar_metrics.png`, `feature_combination_comparison.png`.
-
-- **Đánh giá ổn định theo thời gian và thống kê**
-  - **Rolling TimeSeriesSplit AUC** (`rolling_auc.png`): AUC theo từng fold thời gian để xem tính ổn định.  
-  - **Bootstrap CI** (`auc_confidence_intervals.png`): khoảng tin cậy 95% cho AUC từng mô hình.  
-  - **Wilcoxon signed-rank test** (`statistical_comparison.png`, `statistical_tests.csv`): xác định chênh lệch giữa mô hình tốt nhất và các mô hình khác có **ý nghĩa thống kê** hay không (p-value < 0.05).
-
-- **Phân tích diễn giải mô hình**
-  - **Confusion Matrix** (`confusion_matrix.png`): phân tích lỗi dự đoán.  
-  - **ROC Curve, Precision–Recall Curve** (`roc_curve_best_model.png`, `precision_recall_curve.png`).  
-  - **SHAP & Permutation Importance** (`shap_summary.png`, `permutation_importance.png`): xác định đặc trưng nào đóng góp nhiều nhất vào quyết định của mô hình.
-
----
-
-## Kết quả trả ra
-
-- **File dữ liệu và báo cáo**
-  - `data/news_with_sentiment.csv`: tin tức đã được gán sentiment cho từng tiêu đề.  
-  - `model_results.csv`: bảng tổng hợp Accuracy, AUC, Precision, Recall, F1, AP cho từng tổ hợp feature.  
-  - `sector_results.csv`: hiệu suất (AUC, Accuracy, F1) của mô hình tốt nhất trên từng ngành.  
-  - `statistical_tests.csv`: kết quả kiểm định Wilcoxon giữa mô hình tốt nhất và các mô hình khác.  
-  - `feature_combination_analysis.csv`: bảng xếp hạng và phân tích chi tiết ablation study.
-
-- **Biểu đồ / hình ảnh trong thư mục `visualizations/`** (được sinh khi chạy code)
-  - `sentiment_distribution.png`: phân phối nhãn và điểm sentiment từ PhoBERT.  
-  - `ablation_auc_bar.png`, `feature_combination_comparison.png`, `radar_metrics.png`: so sánh hiệu suất các nhóm feature.  
-  - `rolling_auc.png`: AUC theo từng fold thời gian.  
-  - `precision_recall_curve.png`, `roc_curve_best_model.png`, `confusion_matrix.png`: đánh giá chi tiết mô hình tốt nhất.  
-  - `permutation_importance.png`, `shap_summary.png`: độ quan trọng đặc trưng.  
-  - `feature_correlation.png`: ma trận tương quan giữa các đặc trưng.  
-  - `sector_performance.png`: hiệu suất theo ngành.  
-  - `auc_confidence_intervals.png`, `statistical_comparison.png`: kết quả bootstrap CI và kiểm định thống kê.  
-  - `learning_curve.png`: đường cong hội tụ loss của MLP.
-
----
-
-## Kết quả kỳ vọng
-
-- **Về mặt định lượng**
-  - Mô hình tốt nhất (thường là nhóm feature kết hợp, ví dụ `All` hoặc `Tech+Sent`) được kỳ vọng đạt **AUC cao hơn đáng kể mức ngẫu nhiên 0.5**, nằm trong khoảng **0.55–0.65** tùy chất lượng dữ liệu.  
-  - Accuracy và F1 ở mức trên 0.55–0.60, thể hiện khả năng nhận diện các phiên “tăng mạnh” tốt hơn đoán ngẫu nhiên.  
-  - Bootstrap CI cho AUC **không cắt qua 0.5** đối với mô hình tốt nhất, cho thấy tín hiệu dự báo có ý nghĩa.  
-  - Các kiểm định Wilcoxon cho thấy mô hình tốt nhất có **p-value < 0.05** khi so với một số cấu hình kém hơn, chứng minh cải thiện có ý nghĩa thống kê.
-
-- **Về mặt định tính / diễn giải**
-  - Các đặc trưng **momentum, volatility, một số chỉ tiêu cơ bản và sentiment** được kỳ vọng nằm trong nhóm feature quan trọng nhất theo SHAP và Permutation Importance.  
-  - Một số ngành có cấu trúc dòng tiền và tin tức rõ ràng (ví dụ tài chính, ngân hàng, hàng tiêu dùng) được kỳ vọng có **AUC cao hơn mặt bằng chung** trong `sector_results.csv`.  
-  - Kết quả cho thấy việc **kết hợp thông tin kỹ thuật + cơ bản + cảm xúc thị trường** giúp mô hình ổn định hơn so với từng nhóm đặc trưng đơn lẻ, dù mức cải thiện có thể vừa phải (synergy nhẹ thay vì nhảy vọt).
-
----
-
-## Thống kê mô tả (nằm trong mlp_complete.py)
-
-Toàn bộ thống kê mô tả **không tách riêng**: chạy trong **Phase 2** của `mlp_complete.py` (giá OHLC, fundamental, news). Khi chạy `python mlp_complete.py` bạn sẽ có:
-
-- Bảng + histogram giá (return 1d/5d, volatility) → `output/desc_ohlc_overview.csv`, `visualizations/desc_ohlc_hist_*.png`
-- Thống kê fundamental (PE, ROE) + phân phối PE → `visualizations/desc_fund_pe_dist.png`
-- Tổng quan news, news theo doanh nghiệp, histogram news/ngày, news theo năm, phân phối sentiment → `output/news_by_company.csv`, `visualizations/news_histogram_per_day.png`, `news_bar_by_year.png`, `news_sentiment_dist.png`
-
----
-
-## Cách chạy nhanh
-
-- Cài đặt thư viện (môi trường Python 3.x):
 ```bash
-pip install numpy pandas matplotlib seaborn scikit-learn shap imbalanced-learn
+pip install pandas numpy scikit-learn matplotlib seaborn shap scipy
 pip install torch transformers tqdm
+pip install imbalanced-learn
 ```
 
-- Chạy lần lượt hai bước chính:
-```bash
-# 1. Tạo cache sentiment (chỉ cần chạy lại khi thay đổi news.csv)
-python sentiment_analysis.py
+---
 
-# 2. Huấn luyện và đánh giá mô hình MLP
+## Dữ liệu
+
+Đặt các file sau trong thư mục `data/`:
+
+| File | Mô tả |
+|------|--------|
+| `ohlc.csv` | Giá OHLC + volume theo `mack`, `date` |
+| `fundamental.csv` | Chỉ số cơ bản (eps, roe, pe, …) theo `mack`, `nam`, `quy` |
+| `news.csv` | Tin tức với cột `mack`, `date`, `title` (hoặc `text`) |
+
+Sau khi chạy sentiment sẽ có thêm: `news_with_sentiment.csv`, `news_stats.csv`.  
+Sau khi chạy MLP sẽ có thêm: `descriptive_stats.csv`.
+
+---
+
+## Cách chạy
+
+### 1. Phân tích sentiment (PhoBERT)
+
+Tạo điểm sentiment cho tin tức, lưu vào `data/news_with_sentiment.csv`:
+
+```bash
+python sentiment_analysis.py
+```
+
+Tính lại từ đầu (bỏ cache):
+
+```bash
+python sentiment_analysis.py --recompute
+```
+
+**Đầu ra:** `data/news_with_sentiment.csv`, `data/news_stats.csv`, `visualizations/sentiment_distribution.png`
+
+---
+
+### 2. Huấn luyện và đánh giá mô hình MLP
+
+Chạy toàn bộ pipeline MLP (load dữ liệu, tạo feature, train, đánh giá, vẽ đồ thị):
+
+```bash
 python mlp_complete.py
 ```
 
-*(Bạn cũng có thể sử dụng `run_all.bat` nếu đã cấu hình sẵn trên Windows.)*
+**Cấu hình chính trong code:**
+
+- **Target:** Nhị phân theo quantile 30/70 (return ≤ q30 → 0, return ≥ q70 → 1).
+- **Chia dữ liệu:** 70% thời gian train, 30% test (time-based).
+- **Sentiment:** Chỉ dùng điểm `sent_score` (đã gộp theo ngày), không dùng nhãn pos/neu/neg.
+- **Đa cộng tuyến:** Loại bỏ cặp biến có |tương quan| > 0.8 trước khi train.
+
+**Đầu ra:**
+
+- `model_results.csv` — Kết quả ablation (AUC, Accuracy, F1, …) theo từng nhóm feature.
+- `data/descriptive_stats.csv` — Thống kê mô tả các biến.
+- `sector_results.csv`, `statistical_tests.csv`, `feature_combination_analysis.csv` (nếu có).
+- Thư mục `visualizations/`: ROC, confusion matrix, learning curve, SHAP, correlation heatmap, rolling AUC, v.v.
+
+---
+
+### 3. Chạy một lần (Sentiment + MLP)
+
+Trên Windows có thể dùng:
+
+```bash
+run_all.bat
+```
+
+(Sửa đường dẫn Python trong file nếu cần.)
+
+---
+
+## Cấu trúc pipeline MLP (tóm tắt)
+
+| Phase | Nội dung |
+|-------|----------|
+| 1 | Load OHLC, fundamental, news (có sentiment nếu đã chạy bước 1) |
+| 2 | Chỉ báo kỹ thuật (RSI, MACD, SMA, EMA, Bollinger, volume, momentum) |
+| 3 | Fundamental resample theo ngày |
+| 4 | Gộp sentiment theo ngày (chỉ sent_score) |
+| 5 | Merge, xử lý missing, sector |
+| 6 | Tạo target 30/70, split 70/30 theo thời gian |
+| 7 | Nhóm feature (Fundamental, Technical, Sentiment, All) |
+| 7b | Loại đa cộng tuyến (|r| > 0.8) |
+| 7c | Thống kê mô tả các biến → `descriptive_stats.csv` |
+| 8 | Scale (RobustScaler), SMOTE, train MLP, ablation |
+| 9 | TimeSeriesSplit, chọn best model, AUC/Accuracy/F1 |
+| 10 | Trực quan: SHAP, permutation importance, ROC, heatmap, learning curve, rolling AUC |
+
+---
+
+## Cấu trúc thư mục gợi ý
+
+```
+K224141657/
+├── README.md
+├── sentiment_analysis.py    # PhoBERT sentiment
+├── mlp_complete.py          # Pipeline MLP đầy đủ
+├── run_all.bat              # Chạy sentiment + MLP (Windows)
+├── data/
+│   ├── ohlc.csv
+│   ├── fundamental.csv
+│   ├── news.csv
+│   ├── news_with_sentiment.csv   # Sau sentiment
+│   ├── news_stats.csv
+│   └── descriptive_stats.csv     # Sau MLP
+├── visualizations/               # Đồ thị từ mlp_complete & sentiment
+├── model_results.csv
+├── sector_results.csv
+├── statistical_tests.csv
+└── feature_combination_analysis.csv
+```
+
+---
+
+## Cải thiện AUC
+
+Nếu mô hình cho AUC xấp xỉ 0.5 (gần đoán ngẫu nhiên), xem file **[IMPROVE_AUC.md](IMPROVE_AUC.md)** để biết hướng kiểm tra dữ liệu, target, feature và mô hình. Trong code đã có **Phase 7d** in tương quan feature–target để chẩn đoán nhanh.
+
+## Ghi chú
+
+- Sentiment dùng mô hình `wonrax/phobert-base-vietnamese-sentiment` (transformers).
+- MLP: `RobustScaler`, SMOTE (nếu cài imbalanced-learn), early stopping.
+- Heatmap tương quan vẽ trên bộ feature **sau khi** đã bỏ đa cộng tuyến.

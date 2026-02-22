@@ -430,6 +430,52 @@ feature_groups = {
 print(f"  Số feature sau khi bỏ đa cộng tuyến: {len(features_after_vif)} (trước: {len(all_feats)})")
 
 # -------------------------------------------------------------
+# Phase 7c — THỐNG KÊ MÔ TẢ CÁC BIẾN
+# -------------------------------------------------------------
+desc_cols = [f for f in features_after_vif if f in df.columns]
+if desc_cols:
+    _d = df[desc_cols]
+    descriptive_stats = _d.describe(percentiles=[0.25, 0.5, 0.75]).T
+    descriptive_stats = descriptive_stats.rename(columns={"50%": "median"})
+    descriptive_stats["missing"] = _d.isna().sum()
+    try:
+        descriptive_stats["skew"] = _d.skew()
+    except Exception:
+        pass
+    try:
+        descriptive_stats["kurtosis"] = _d.kurtosis()
+    except Exception:
+        pass
+    out_desc = os.path.join(DATA_DIR, "descriptive_stats.csv")
+    descriptive_stats.to_csv(out_desc, encoding="utf-8-sig")
+    print("\n" + "=" * 60)
+    print("Phase 7c: Thống kê mô tả các biến (feature)")
+    print("=" * 60)
+    print(f"  Số biến: {len(desc_cols)}")
+    print(f"  Số quan sát (dòng): {len(df):,}")
+    print()
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", None)
+    print(descriptive_stats.round(4).to_string())
+    pd.reset_option("display.max_columns")
+    pd.reset_option("display.width")
+    print(f"\n✓ Đã lưu: {out_desc}")
+
+# -------------------------------------------------------------
+# Phase 7d — CHẨN ĐOÁN: Tương quan feature–target (kiểm tra có tín hiệu không)
+# -------------------------------------------------------------
+# Nếu mọi |corr| đều rất nhỏ (~0), nhiều khả năng dữ liệu/target không có tín hiệu → AUC ~0.5
+_diag_cols = [f for f in features_after_vif if f in df.columns]
+if _diag_cols and "target" in df.columns:
+    _corr_target = df[_diag_cols].corrwith(df["target"]).abs().sort_values(ascending=False)
+    print("\n" + "=" * 60)
+    print("Phase 7d: Tương quan (|r|) feature – target (top 15)")
+    print("=" * 60)
+    print(_corr_target.head(15).round(4).to_string())
+    if _corr_target.max() < 0.05:
+        print("\n⚠️ Cảnh báo: |r| đều < 0.05 → tín hiệu yếu, dễ dẫn tới AUC ~0.5. Xem IMPROVE_AUC.md để cải thiện.")
+
+# -------------------------------------------------------------
 # Phase 8 — MLP TRAINING (scale, SMOTE)
 # -------------------------------------------------------------
 def train_mlp_time_split(
