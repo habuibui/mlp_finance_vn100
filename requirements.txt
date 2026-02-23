@@ -1,0 +1,14 @@
+# MLP + Sentiment pipeline
+numpy
+pandas
+torch
+transformers
+matplotlib
+tqdm
+scikit-learn
+seaborn
+scipy
+# Sentiment crawl (sentiment_analysis.py)
+requests
+beautifulsoup4
+lxml

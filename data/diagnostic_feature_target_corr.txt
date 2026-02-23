@@ -1,0 +1,27 @@
+Feature – target (1/0/-1) |r| (toàn bộ)
+volatility_20d            0.0320
+bb_lower                  0.0280
+ret_3d                    0.0232
+vonhoa_tts                0.0199
+ret_5d                    0.0164
+hl_range_pct              0.0164
+macd_hist                 0.0128
+volume_ratio              0.0111
+ret_10d                   0.0097
+pb                        0.0089
+nophaitra_vcsh            0.0083
+ret_1d                    0.0072
+macd                      0.0065
+lnst_yoy                  0.0061
+roa                       0.0055
+rsi                       0.0047
+sent_score_std            0.0015
+roe                       0.0014
+sent_score_min            0.0011
+sent_score_mean_change    0.0010
+pe                        0.0009
+sent_score_max            0.0008
+
+Max |r| (target) = 0.0320.
+Max |r| (future_return liên tục) = 0.0676.
+Nếu cả hai đều < 0.05 → tín hiệu rất yếu. Xem ROOT_CAUSE_LOW_AUC.md.

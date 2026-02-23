@@ -2,20 +2,21 @@
 # SENTIMENT ANALYSIS - PHOBERT
 # Run ONCE to create sentiment cache
 # =====================================================
-"""
-Sentiment Analysis Module using PhoBERT
-----------------------------------------
-This module processes Vietnamese news headlines and assigns sentiment scores
-using the pre-trained PhoBERT model fine-tuned for Vietnamese sentiment analysis.
 
-Author: [Your Name]
-Date: 2026
-"""
 
 import os
 import pandas as pd
 import numpy as np
 import torch
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    CRAWL_AVAILABLE = True
+except ImportError:
+    CRAWL_AVAILABLE = False
+    requests = None
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -31,6 +32,12 @@ INPUT_FILE = "data/news.csv"
 OUTPUT_FILE = "data/news_with_sentiment.csv"
 VIS_DIR = "visualizations"
 os.makedirs(VIS_DIR, exist_ok=True)
+
+# Cột nguồn ưu tiên: content > summary > title
+SOURCE_TEXT_COLS = ["content", "summary", "title"]
+TEXT_COL = "text"
+MAX_LENGTH = 384  # Dùng content nên tăng (trước 256)
+SENTIMENT_MODEL = "wonrax/phobert-base-vietnamese-sentiment"
 
 # ==============================
 # 🚨 CACHE CHECK
@@ -92,10 +99,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 try:
-    tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "wonrax/phobert-base-vietnamese-sentiment"
-    )
+    tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL)
     model = model.to(device)
     model.eval()
     print("✓ PhoBERT loaded successfully")
@@ -119,18 +124,101 @@ except FileNotFoundError:
 
 
 # ==============================
-# PREPARE TEXT
+# CRAWL NỘI DUNG BÀI VIẾT (nếu chưa có content)
+# Cần: pip install requests beautifulsoup4 lxml
 # ==============================
-news["text"] = news["title"].fillna("").astype(str)
-news["text"] = news["text"].str.replace("\n", " ").str.strip()
-news = news.reset_index(drop=True)
+def create_session():
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.5)
+    session.mount("http://", HTTPAdapter(max_retries=retries))
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+
+
+def fetch_article_content(url: str, session: requests.Session) -> str:
+    """
+    Crawl nội dung bài viết từ URL.
+    Trả về text đã làm sạch.
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = session.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "lxml")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        paragraphs = soup.find_all("p")
+        text = " ".join([p.get_text(strip=True) for p in paragraphs])
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def enrich_with_content(news: pd.DataFrame) -> pd.DataFrame:
+    """
+    Nếu chưa có cột content thì crawl từ url.
+    """
+    if "url" not in news.columns:
+        print("⚠️ Không có cột url → dùng title, không crawl.")
+        news["content"] = ""
+        return news
+    session = create_session()
+    contents = []
+    print("\nCrawling article content...")
+    for url in tqdm(news["url"].fillna(""), desc="Fetching content"):
+        if not url:
+            contents.append("")
+        else:
+            contents.append(fetch_article_content(url, session))
+    news["content"] = contents
+    return news
+
+
+# Crawl content nếu chưa có (cần: pip install requests beautifulsoup4 lxml)
+if "content" not in news.columns or news["content"].isna().all():
+    if CRAWL_AVAILABLE:
+        news = enrich_with_content(news)
+    else:
+        print("  ⚠️ Thiếu thư viện crawl (requests/beautifulsoup4/lxml) → dùng title. Chạy: pip install requests beautifulsoup4 lxml")
+        news["content"] = ""
+else:
+    print("  Đã có cột content, bỏ qua crawl.")
+
+
+# ==============================
+# PREPARE TEXT (ưu tiên content → fallback title)
+# ==============================
+def prepare_text(news: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ưu tiên content → nếu rỗng/ngắn thì fallback về title.
+    """
+    df = news.copy()
+    content = df.get("content", pd.Series("", index=df.index)).fillna("").astype(str)
+    title = df.get("title", pd.Series("", index=df.index)).fillna("").astype(str)
+    text = np.where(content.str.len() > 50, content, title)
+    df[TEXT_COL] = (
+        pd.Series(text, index=df.index)
+        .str.replace("\n", " ", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    return df
+
+
+news = prepare_text(news)
+# Bỏ dòng không có nội dung đủ dài (tùy chọn: giữ lại thì gán sent = 0 sau)
+min_text_len = 10
+before = len(news)
+news = news[news[TEXT_COL].str.len() >= min_text_len].reset_index(drop=True)
+if before > len(news):
+    print(f"  Bỏ {before - len(news)} tin có text < {min_text_len} ký tự. Còn {len(news):,} tin.")
 
 
 # ==============================
 # BATCH SENTIMENT FUNCTION
 # ==============================
 @torch.no_grad()
-def batch_phobert_sentiment(texts, max_length=256):
+def batch_phobert_sentiment(texts, max_length=None):
     """
     Batch sentiment analysis using PhoBERT.
     
@@ -139,13 +227,15 @@ def batch_phobert_sentiment(texts, max_length=256):
     texts : list[str]
         List of Vietnamese text strings to analyze.
     max_length : int, optional
-        Maximum token length for truncation. Default is 256.
+        Maximum token length for truncation. Default from config (384 when using content).
         
     Returns
     -------
     np.ndarray
         Shape (batch, 3) with probabilities for [positive, neutral, negative].
     """
+    if max_length is None:
+        max_length = MAX_LENGTH
     encodings = tokenizer(
         texts,
         padding=True,
@@ -169,8 +259,6 @@ def batch_phobert_sentiment(texts, max_length=256):
 print("\nRunning sentiment analysis...")
 
 BATCH_SIZE = 64 if device.type == "cuda" else 16
-MAX_LEN = 256
-TEXT_COL = "text"
 
 texts = news[TEXT_COL].fillna("").astype(str).tolist()
 n = len(texts)
@@ -179,15 +267,31 @@ all_probs = np.empty((n, 3), dtype=np.float32)
 
 for i in tqdm(range(0, n, BATCH_SIZE), desc="PhoBERT Sentiment"):
     batch_texts = texts[i:i + BATCH_SIZE]
-    probs = batch_phobert_sentiment(batch_texts, max_length=MAX_LEN)
+    probs = batch_phobert_sentiment(batch_texts, max_length=MAX_LENGTH)
     all_probs[i:i + len(batch_texts)] = probs
 
 news["sent_pos"] = all_probs[:, 0]
 news["sent_neu"] = all_probs[:, 1]
 news["sent_neg"] = all_probs[:, 2]
 
-# Sentiment score (continuous)
+# Continuous score [-1, 1]
 news["sent_score"] = news["sent_pos"] - news["sent_neg"]
+
+# Có tin thực sự không?
+news["has_news"] = (news[TEXT_COL].str.len() > 20).astype(int)
+# Cường độ tin tức
+news["sent_intensity"] = news["sent_score"] * news["has_news"]
+
+# Sentiment shock (bất ngờ thông tin) – thường predictive hơn level
+news["sent_score_rolling3"] = (
+    news.groupby("mack")["sent_score"]
+    .transform(lambda x: x.rolling(3, min_periods=1).mean())
+)
+news["sent_shock"] = news["sent_score"] - news["sent_score_rolling3"]
+
+# Lag sentiment (phù hợp target 5d)
+news["sent_score_lag1"] = news.groupby("mack")["sent_score"].shift(1)
+news["sent_score_lag2"] = news.groupby("mack")["sent_score"].shift(2)
 
 # Map to {-1, 0, 1}
 sent_label_idx = all_probs.argmax(axis=1)
@@ -245,6 +349,9 @@ print(f"✓ Saved: {VIS_DIR}/sentiment_distribution.png")
 # ==============================
 # SAVE RESULTS
 # ==============================
+# Giữ đủ cột (sent_pos, sent_neu, sent_neg, sent_score, has_news, sent_intensity,
+# sent_shock, sent_score_lag1, sent_score_lag2, ...) để tương thích pipeline & viz.
+# Nếu muốn giảm nhiễu có thể chỉ lưu: sent_score, sent_shock, sent_score_lag1, sent_intensity, has_news
 print(f"\nSaving to {OUTPUT_FILE}...")
 news.to_csv(OUTPUT_FILE, index=False)
 print("✓ Sentiment analysis completed!")

@@ -1,23 +1,6 @@
 # -------------------------------------------------------------
 # 1. IMPORTS & GLOBAL SETTINGS
 # -------------------------------------------------------------
-"""
-MLP Stock Prediction Model - Complete Pipeline
------------------------------------------------
-This module implements a Multi-Layer Perceptron (MLP) classifier for stock 
-price movement prediction using technical indicators, fundamental data, 
-and sentiment analysis features.
-
-Features:
-- Ablation study comparing different feature combinations
-- Time-series cross-validation
-- SHAP-based feature importance
-- Comprehensive visualization suite
-
-Author: [Your Name]
-Course: [Course Name]
-Date: 2026
-"""
 import os
 import warnings
 import numpy as np
@@ -69,6 +52,18 @@ NEWS_SENT_PATH = os.path.join(DATA_DIR, "news_with_sentiment.csv")
 VIS_DIR = "visualizations"
 os.makedirs(VIS_DIR, exist_ok=True)
 
+# --- Target: return 5 ngày tới (quantile 20/80) ---
+TARGET_RETURN_DAYS = 5
+
+# --- Chạy nhanh: giảm kích thước mạng, iter, splits, bootstrap/permutation ---
+MLP_HIDDEN = (64, 32)           # mạng nhỏ (mặc định cũ: (256, 128, 64, 32))
+MLP_MAX_ITER = 300              # số epoch tối đa (cũ: 1000)
+MLP_BATCH_SIZE = 256             # batch lớn = ít bước/epoch (cũ: 64)
+ROLLING_N_SPLITS = 3             # số fold rolling (cũ: 5)
+WILCOXON_N_SPLITS = 3            # số fold cho test Wilcoxon (cũ: 5)
+PERMUTATION_N_REPEATS = 3        # lặp permutation importance (cũ: 10)
+BOOTSTRAP_N = 200                # số lần bootstrap CI (cũ: 1000)
+
 # -------------------------------------------------------------
 # 3. HELPER: clean column names (strip whitespace, lower‑case)
 # -------------------------------------------------------------
@@ -109,16 +104,19 @@ def compute_rsi(series, window=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# Simple moving averages
-for w in [5, 10, 20, 50]:
+# Simple moving averages (5,10,20,50 + theo mô tả: 14, 28, 100)
+for w in [5, 10, 14, 20, 28, 50, 100]:
     ohlc[f"sma_{w}"] = ohlc.groupby("mack")["close"].transform(lambda x: x.rolling(w).mean())
 
 # Exponential moving averages
 for w in [5, 10, 20, 50]:
     ohlc[f"ema_{w}"] = ohlc.groupby("mack")["close"].transform(lambda x: x.ewm(span=w, adjust=False).mean())
 
-# RSI
-ohlc["rsi"] = ohlc.groupby("mack")["close"].transform(compute_rsi)
+# RSI chu kỳ 9, 14, 28 (theo mô tả)
+ohlc["rsi"] = ohlc.groupby("mack")["close"].transform(compute_rsi)  # 14
+ohlc["rsi_9"] = ohlc.groupby("mack")["close"].transform(lambda x: compute_rsi(x, window=9))
+ohlc["rsi_14"] = ohlc["rsi"].copy()
+ohlc["rsi_28"] = ohlc.groupby("mack")["close"].transform(lambda x: compute_rsi(x, window=28))
 
 # MACD
 ema_12 = ohlc.groupby("mack")["close"].transform(lambda x: x.ewm(span=12, adjust=False).mean())
@@ -144,6 +142,12 @@ for lag in [1, 3, 5, 10]:
 
 # Volatility (Standard Deviation of returns over 20 days)
 ohlc["volatility_20d"] = ohlc.groupby("mack")["close"].transform(lambda x: x.pct_change().rolling(20).std())
+
+# Stochastic oscillator (%K, %D) – chu kỳ 14
+low_14 = ohlc.groupby("mack")["low"].transform(lambda x: x.rolling(14).min())
+high_14 = ohlc.groupby("mack")["high"].transform(lambda x: x.rolling(14).max())
+ohlc["stochastic_k"] = np.where(high_14 > low_14, 100 * (ohlc["close"] - low_14) / (high_14 - low_14), 50)
+ohlc["stochastic_d"] = ohlc.groupby("mack")["stochastic_k"].transform(lambda x: x.rolling(3).mean())
 
 # -------------------------------------------------------------
 # 6. FUNDAMENTAL DATA – DAILY RESAMPLE
@@ -312,26 +316,42 @@ df = df.dropna(subset=["sector"]).reset_index(drop=True)
 print(f"Sectors used: {df['sector'].nunique()}")
 
 # -------------------------------------------------------------
-# TARGET: Quantile-based binary classification
+# 10b. BỔ SUNG CHỈ SỐ KỸ THUẬT (nâng AUC): log volume, MA gap, crossover, rank, interaction
 # -------------------------------------------------------------
+if "volume" in df.columns:
+    df["volume"] = np.log1p(df["volume"].clip(lower=0))
+if "sma_20" in df.columns and df["sma_20"].gt(0).any():
+    df["sma20_gap"] = np.where(df["sma_20"] > 0, (df["close"] - df["sma_20"]) / df["sma_20"], 0)
+if "sma_10" in df.columns and "sma_50" in df.columns:
+    denom = df["sma_50"].replace(0, np.nan)
+    df["sma_cross"] = ((df["sma_10"] - df["sma_50"]) / denom).fillna(0).replace([np.inf, -np.inf], 0)
+if "ret_5d" in df.columns and "date" in df.columns:
+    df["ret_5d_rank"] = df.groupby("date")["ret_5d"].rank(pct=True)
+if "ret_5d" in df.columns and "volatility_20d" in df.columns:
+    df["momentum_vol"] = df["ret_5d"] * df["volatility_20d"]
+print("  Đã thêm: log(volume), sma20_gap, sma_cross, ret_5d_rank, momentum_vol")
 
-df["future_return_5d"] = (
+# -------------------------------------------------------------
+# TARGET: Quantile-based binary (return 1d hoặc 5d tùy TARGET_RETURN_DAYS)
+# -------------------------------------------------------------
+_n = TARGET_RETURN_DAYS
+df["future_return"] = (
     df.groupby("mack")["close"]
-      .pct_change(5)
-      .shift(-5)
+    .pct_change(_n)
+    .shift(-_n)
 )
 
-q_low = df["future_return_5d"].quantile(0.2)
-q_high = df["future_return_5d"].quantile(0.8)
-
+q_low = df["future_return"].quantile(0.2)
+q_high = df["future_return"].quantile(0.8)
 
 df["target"] = np.where(
-    df["future_return_5d"] >= q_high, 1,
-    np.where(df["future_return_5d"] <= q_low, 0, np.nan)
+    df["future_return"] >= q_high, 1,
+    np.where(df["future_return"] <= q_low, 0, np.nan)
 )
 
 df = df.dropna(subset=["target"]).reset_index(drop=True)
 df["target"] = df["target"].astype(int)
+print(f"  Target: return {_n}d tới (quantile 20/80). Lớp 1: {(df['target']==1).sum():,}, Lớp 0: {(df['target']==0).sum():,}")
 
 
 # -------------------------------------------------------------
@@ -339,30 +359,173 @@ df["target"] = df["target"].astype(int)
 # -------------------------------------------------------------
 fundamental_features = [c for c in fund_features if c in df.columns]
 
+# 1. Nhóm Chung (General): giá, khối lượng, tỷ suất sinh lời
+general_features = ["close", "open", "high", "low", "volume", "ret_1d"]
+general_features = [c for c in general_features if c in df.columns]
+
+# 2. Nhóm Phân tích cơ bản (Fundamental): P/B, EPS, P/E, ROE, ROA, nợ/vốn, ...
+# (EV/EBITDA, PEG, Beta không có trong file → bỏ qua; thêm khi có dữ liệu)
+fundamental_features = [c for c in fund_features if c in df.columns]
+
+# 3. Nhóm Phân tích kỹ thuật: SMA, RSI, Stochastic + gap/crossover/rank/tương tác
 technical_features = [
-    "rsi", "macd", "macd_signal", "macd_hist",
-    "sma_5", "sma_20", "sma_50",
-    "ema_5", "ema_20",
-    "bb_upper", "bb_lower", "volume_ratio",
-    "volatility_20d"
+    "sma_14", "sma_28", "sma_50", "sma_100",
+    "rsi_9", "rsi_14", "rsi_28",
+    "stochastic_k", "stochastic_d",
+    "volume_ratio", "volatility_20d",
+    "sma20_gap", "sma_cross", "ret_5d_rank", "momentum_vol",
 ]
-# add lagged returns dynamically
 for lag in [1, 3, 5, 10]:
     technical_features.append(f"ret_{lag}d")
-    
 technical_features = [c for c in technical_features if c in df.columns]
+# Bổ sung nếu thiếu (sma_14/28/100 có thể chưa đủ dữ liệu ở đầu chuỗi)
+for w in [5, 10, 20]:
+    if f"sma_{w}" in df.columns and f"sma_{w}" not in technical_features:
+        technical_features.append(f"sma_{w}")
+if "rsi" in df.columns and "rsi_14" not in df.columns:
+    technical_features.append("rsi")
 
+# 4. Nhóm Tâm lý thị trường (Sentiment): sức mạnh tâm lý, số lượt nhắc đến
 sentiment_features = [c for c in df.columns if c.startswith("sent_")]
+if "news_count" in df.columns:
+    sentiment_features = sentiment_features + ["news_count"]
+sentiment_features = [c for c in sentiment_features if c in df.columns]
 
 feature_groups = {
+    "General": general_features,
     "Fundamental": fundamental_features,
     "Technical": technical_features,
     "Sentiment": sentiment_features,
     "Fund+Tech": fundamental_features + technical_features,
     "Fund+Sent": fundamental_features + sentiment_features,
     "Tech+Sent": technical_features + sentiment_features,
-    "All": fundamental_features + technical_features + sentiment_features,
+    "All": general_features + fundamental_features + technical_features + sentiment_features,
 }
+
+# -------------------------------------------------------------
+# 12b. THỐNG KÊ MÔ TẢ: biến phụ thuộc và biến độc lập
+# -------------------------------------------------------------
+all_feat_cols = [f for f in feature_groups["All"] if f in df.columns]
+dep_cols = ["target"]
+if "future_return" in df.columns:
+    dep_cols.append("future_return")
+
+print("\n" + "=" * 60)
+print("Thống kê mô tả: Biến phụ thuộc và Biến độc lập")
+print("=" * 60)
+
+# Biến phụ thuộc (dependent)
+dep_valid = [c for c in dep_cols if c in df.columns]
+if dep_valid:
+    desc_dep = df[dep_valid].describe(percentiles=[0.25, 0.5, 0.75]).T
+    desc_dep = desc_dep.rename(columns={"50%": "median"})
+    desc_dep["missing"] = df[dep_valid].isna().sum()
+    if "target" in dep_valid:
+        desc_dep.loc["target", "value_counts"] = str(df["target"].value_counts().sort_index().to_dict())
+    path_dep = os.path.join(DATA_DIR, "descriptive_stats_dependent.csv")
+    desc_dep.to_csv(path_dep, encoding="utf-8-sig")
+    print(f"  Biến phụ thuộc: {dep_valid}")
+    print(desc_dep.round(4).to_string())
+    print(f"  -> Đã lưu: {path_dep}")
+
+# Biến độc lập (independent)
+if all_feat_cols:
+    desc_ind = df[all_feat_cols].describe(percentiles=[0.25, 0.5, 0.75]).T
+    desc_ind = desc_ind.rename(columns={"50%": "median"})
+    desc_ind["missing"] = df[all_feat_cols].isna().sum()
+    try:
+        desc_ind["skew"] = df[all_feat_cols].skew()
+    except Exception:
+        pass
+    path_ind = os.path.join(DATA_DIR, "descriptive_stats_independent.csv")
+    desc_ind.to_csv(path_ind, encoding="utf-8-sig")
+    print(f"\n  Biến độc lập: {len(all_feat_cols)} biến (xem file để đầy đủ)")
+    print(desc_ind[["count", "mean", "std", "min", "median", "max", "missing"]].head(15).round(4).to_string())
+    print(f"  -> Đã lưu: {path_ind}")
+
+print("\n  [Đã kiểm tra biến xong. Tiếp tục tiền xử lý dữ liệu...]\n")
+
+# -------------------------------------------------------------
+# 12c. TIỀN XỬ LÝ DỮ LIỆU (sau thống kê mô tả)
+# -------------------------------------------------------------
+# 1. Loại giá trị vô nghĩa (pe, pb > 0)
+if "pe" in df.columns:
+    before = len(df)
+    df = df[df["pe"] > 0].reset_index(drop=True)
+    print(f"  Loại pe <= 0: bỏ {before - len(df)} dòng.")
+if "pb" in df.columns:
+    before = len(df)
+    df = df[df["pb"] > 0].reset_index(drop=True)
+    print(f"  Loại pb <= 0: bỏ {before - len(df)} dòng.")
+
+# 2. Winsorize các biến skew mạnh (chỉ cột có trong df)
+cols_clip = ["pe", "pb", "lnst_yoy", "eps", "nophaitra_vcsh", "volume_ratio"]
+for col in cols_clip:
+    if col in df.columns:
+        q01, q99 = df[col].quantile(0.01), df[col].quantile(0.99)
+        df[col] = df[col].clip(q01, q99)
+print("  Winsorize (0.01, 0.99): đã clip các biến skew mạnh.")
+
+# 3. Log transform biến lệch mạnh
+if "pe" in df.columns:
+    df["pe"] = np.log1p(df["pe"])
+if "pb" in df.columns:
+    df["pb"] = np.log1p(df["pb"])
+if "eps" in df.columns:
+    df["eps"] = np.log1p(df["eps"].clip(lower=0))
+if "lnst_yoy" in df.columns:
+    df["lnst_yoy"] = np.sign(df["lnst_yoy"]) * np.log1p(np.abs(df["lnst_yoy"]))
+print("  Log transform: pe, pb, eps, lnst_yoy.")
+
+# 4. Fill missing (fundamental) bằng median
+for col in fundamental_features:
+    if col in df.columns and df[col].isna().any():
+        df[col] = df[col].fillna(df[col].median())
+print("  Fill missing: fundamental bằng median.")
+
+# 5. StandardScaler: thực hiện trong train (RobustScaler theo từng fold)
+print("  Chuẩn hóa (scale): dùng RobustScaler khi train từng fold.\n")
+
+# -------------------------------------------------------------
+# 12d. THỐNG KÊ MÔ TẢ (sau tiền xử lý) – kiểm tra biến đã đúng chưa
+# -------------------------------------------------------------
+_all_feat2 = [f for f in feature_groups["All"] if f in df.columns]
+_dep_cols2 = ["target"]
+if "future_return" in df.columns:
+    _dep_cols2.append("future_return")
+
+print("\n" + "=" * 60)
+print("Thống kê mô tả (SAU tiền xử lý) – kiểm tra các biến")
+print("=" * 60)
+
+_dep_valid2 = [c for c in _dep_cols2 if c in df.columns]
+if _dep_valid2:
+    _desc_dep2 = df[_dep_valid2].describe(percentiles=[0.25, 0.5, 0.75]).T
+    _desc_dep2 = _desc_dep2.rename(columns={"50%": "median"})
+    _desc_dep2["missing"] = df[_dep_valid2].isna().sum()
+    if "target" in _dep_valid2:
+        _desc_dep2.loc["target", "value_counts"] = str(df["target"].value_counts().sort_index().to_dict())
+    _path_dep2 = os.path.join(DATA_DIR, "descriptive_stats_dependent_after_preprocess.csv")
+    _desc_dep2.to_csv(_path_dep2, encoding="utf-8-sig")
+    print(f"  Biến phụ thuộc: {_dep_valid2}")
+    print(_desc_dep2.round(4).to_string())
+    print(f"  -> Đã lưu: {_path_dep2}")
+
+if _all_feat2:
+    _desc_ind2 = df[_all_feat2].describe(percentiles=[0.25, 0.5, 0.75]).T
+    _desc_ind2 = _desc_ind2.rename(columns={"50%": "median"})
+    _desc_ind2["missing"] = df[_all_feat2].isna().sum()
+    try:
+        _desc_ind2["skew"] = df[_all_feat2].skew()
+    except Exception:
+        pass
+    _path_ind2 = os.path.join(DATA_DIR, "descriptive_stats_independent_after_preprocess.csv")
+    _desc_ind2.to_csv(_path_ind2, encoding="utf-8-sig")
+    print(f"\n  Biến độc lập: {len(_all_feat2)} biến (xem file để đầy đủ)")
+    print(_desc_ind2[["count", "mean", "std", "min", "median", "max", "missing"]].head(15).round(4).to_string())
+    print(f"  -> Đã lưu: {_path_ind2}")
+
+print("\n  [Đã kiểm tra biến sau tiền xử lý. Tiếp tục huấn luyện mô hình...]\n")
 
 # -------------------------------------------------------------
 # 13. MLP TRAINING
@@ -419,17 +582,17 @@ def train_mlp_time_split(
     # MLP model
     # --------------------
     model = MLPClassifier(
-        hidden_layer_sizes=(256, 128, 64, 32),
+        hidden_layer_sizes=MLP_HIDDEN,
         activation="relu",
         solver="adam",
         alpha=0.001,
         learning_rate="adaptive",
         learning_rate_init=0.001,
-        batch_size=64,
-        max_iter=1000,
+        batch_size=MLP_BATCH_SIZE,
+        max_iter=MLP_MAX_ITER,
         early_stopping=True,
         validation_fraction=0.15,
-        n_iter_no_change=20,
+        n_iter_no_change=15,
         random_state=RANDOM_STATE,
         verbose=False
     )
@@ -508,7 +671,9 @@ plt.show()
 # 15. Rolling Timeseries AUC
 # -------------------------------------------------------------
 
-def rolling_timeseries_auc_with_plot(df, features, n_splits=5):
+def rolling_timeseries_auc_with_plot(df, features, n_splits=None):
+    if n_splits is None:
+        n_splits = ROLLING_N_SPLITS
     data = df[features + ["target"]].dropna()
     X = data[features].values
     y = data["target"].values
@@ -522,8 +687,9 @@ def rolling_timeseries_auc_with_plot(df, features, n_splits=5):
         X_test = scaler.transform(X[test_idx])
 
         model = MLPClassifier(
-            hidden_layer_sizes=(256,128,64,32),
-            max_iter=500,
+            hidden_layer_sizes=MLP_HIDDEN,
+            max_iter=MLP_MAX_ITER,
+            batch_size=MLP_BATCH_SIZE,
             random_state=RANDOM_STATE
         )
         model.fit(X_train, y[train_idx])
@@ -563,7 +729,7 @@ def permutation_importance_auc(model, X, y, feature_names):
         X,
         y,
         scoring="roc_auc",
-        n_repeats=10,
+        n_repeats=PERMUTATION_N_REPEATS,
         random_state=RANDOM_STATE,
         n_jobs=-1
     )
@@ -927,7 +1093,9 @@ print("=" * 60)
 # -------------------------------------------------------------
 print("\n📊 18.1 Computing Bootstrap Confidence Intervals for AUC...")
 
-def bootstrap_ci(y_true, y_prob, n_bootstraps=1000, ci=0.95, random_state=42):
+def bootstrap_ci(y_true, y_prob, n_bootstraps=None, ci=0.95, random_state=42):
+    if n_bootstraps is None:
+        n_bootstraps = BOOTSTRAP_N
     """
     Compute bootstrap confidence interval for AUC.
     
@@ -968,7 +1136,8 @@ def bootstrap_ci(y_true, y_prob, n_bootstraps=1000, ci=0.95, random_state=42):
 # Compute CI for best model
 mean_auc, ci_lower, ci_upper = bootstrap_ci(
     best_res["y_test"],
-    best_res["y_prob"]
+    best_res["y_prob"],
+    n_bootstraps=BOOTSTRAP_N
 )
 
 print(f"\nBest Model ({best_model_name}) AUC with 95% CI:")
@@ -1018,40 +1187,42 @@ print(f"✓ Saved: {VIS_DIR}/auc_confidence_intervals.png")
 # -------------------------------------------------------------
 print("\n📊 18.2 Performing Wilcoxon Signed-Rank Tests...")
 
-def paired_cv_comparison(df, features1, features2, n_splits=5):
+def paired_cv_comparison(df, features1, features2, n_splits=None):
     """
     Perform paired cross-validation for statistical comparison.
     Returns paired AUC scores for each fold.
     """
+    if n_splits is None:
+        n_splits = WILCOXON_N_SPLITS
     all_features = list(set(features1 + features2))
     data = df[all_features + ["target"]].dropna()
     X = data[all_features]
     y = data["target"].values
-    
+
     tscv = TimeSeriesSplit(n_splits=n_splits)
     aucs1, aucs2 = [], []
-    
+
     for train_idx, test_idx in tscv.split(X):
         # Model 1
         X1 = data[features1].values
         scaler1 = RobustScaler()
         X1_train = scaler1.fit_transform(X1[train_idx])
         X1_test = scaler1.transform(X1[test_idx])
-        
-        model1 = MLPClassifier(hidden_layer_sizes=(256, 128, 64, 32),
-                               max_iter=500, random_state=RANDOM_STATE)
+
+        model1 = MLPClassifier(hidden_layer_sizes=MLP_HIDDEN, max_iter=MLP_MAX_ITER,
+                               batch_size=MLP_BATCH_SIZE, random_state=RANDOM_STATE)
         model1.fit(X1_train, y[train_idx])
         prob1 = model1.predict_proba(X1_test)[:, 1]
         aucs1.append(roc_auc_score(y[test_idx], prob1))
-        
+
         # Model 2
         X2 = data[features2].values
         scaler2 = RobustScaler()
         X2_train = scaler2.fit_transform(X2[train_idx])
         X2_test = scaler2.transform(X2[test_idx])
-        
-        model2 = MLPClassifier(hidden_layer_sizes=(256, 128, 64, 32),
-                               max_iter=500, random_state=RANDOM_STATE)
+
+        model2 = MLPClassifier(hidden_layer_sizes=MLP_HIDDEN, max_iter=MLP_MAX_ITER,
+                               batch_size=MLP_BATCH_SIZE, random_state=RANDOM_STATE)
         model2.fit(X2_train, y[train_idx])
         prob2 = model2.predict_proba(X2_test)[:, 1]
         aucs2.append(roc_auc_score(y[test_idx], prob2))
@@ -1070,10 +1241,10 @@ for name, feats in feature_groups.items():
     
     try:
         aucs_best, aucs_other = paired_cv_comparison(
-            df, 
-            feature_groups[best_model_name], 
+            df,
+            feature_groups[best_model_name],
             feats,
-            n_splits=5
+            n_splits=WILCOXON_N_SPLITS
         )
         
         # Wilcoxon test (two-sided)
