@@ -402,6 +402,37 @@ feature_groups = {
     "All": general_features + fundamental_features + technical_features + sentiment_features,
 }
 
+# Loại biến đa cộng tuyến (|r| > 0.9): giữ 1 trong mỗi cặp
+def _drop_high_corr(data, feats, thresh=0.9):
+    feats = [f for f in feats if f in data.columns]
+    if len(feats) < 2:
+        return feats
+    corr = data[feats].corr()
+    to_drop = set()
+    for i in range(len(feats)):
+        for j in range(i + 1, len(feats)):
+            if abs(corr.iloc[i, j]) > thresh:
+                to_drop.add(feats[j])
+    return [f for f in feats if f not in to_drop]
+
+_all_before = len(feature_groups["All"])
+_kept = _drop_high_corr(df, feature_groups["All"], 0.9)
+for _k in feature_groups:
+    feature_groups[_k] = [f for f in feature_groups[_k] if f in _kept]
+if len(_kept) < _all_before:
+    print(f"  Đa cộng tuyến (|r|>0.9): giữ {len(_kept)}/{_all_before} biến.")
+
+# Giữ 1 RSI đại diện (bỏ rsi_9, rsi_28 để giảm đa cộng tuyến)
+_rsi_drop = ["rsi_9", "rsi_28"]
+if "rsi_14" in feature_groups["Technical"]:
+    for _r in _rsi_drop:
+        if _r in feature_groups["Technical"]:
+            feature_groups["Technical"].remove(_r)
+    feature_groups["Fund+Tech"] = feature_groups["Fundamental"] + feature_groups["Technical"]
+    feature_groups["Tech+Sent"] = feature_groups["Technical"] + feature_groups["Sentiment"]
+    feature_groups["All"] = feature_groups["General"] + feature_groups["Fundamental"] + feature_groups["Technical"] + feature_groups["Sentiment"]
+    print("  RSI: giữ rsi_14 đại diện (bỏ rsi_9, rsi_28).")
+
 # -------------------------------------------------------------
 # 12b. THỐNG KÊ MÔ TẢ: biến phụ thuộc và biến độc lập
 # -------------------------------------------------------------
@@ -458,15 +489,25 @@ if "pb" in df.columns:
     df = df[df["pb"] > 0].reset_index(drop=True)
     print(f"  Loại pb <= 0: bỏ {before - len(df)} dòng.")
 
-# 2. Winsorize các biến skew mạnh (chỉ cột có trong df)
-cols_clip = ["pe", "pb", "lnst_yoy", "eps", "nophaitra_vcsh", "volume_ratio"]
+# 2. Log-transform giá & SMA (skew > 1) – giảm bias gradient
+price_sma_cols = ["close", "open", "high", "low"]
+for w in [5, 10, 14, 20, 28, 50, 100]:
+    if f"sma_{w}" in df.columns:
+        price_sma_cols.append(f"sma_{w}")
+for col in price_sma_cols:
+    if col in df.columns:
+        df[col] = np.log(df[col].clip(lower=1e-8))
+print("  Log(price): close, open, high, low, sma_*.")
+
+# 3. Winsorize (1%–99%) + log cho fundamental lệch mạnh
+cols_clip = ["pe", "pb", "lnst_yoy", "eps", "nophaitra_vcsh", "volume_ratio", "roa", "roe", "vonhoa_tts"]
 for col in cols_clip:
     if col in df.columns:
         q01, q99 = df[col].quantile(0.01), df[col].quantile(0.99)
         df[col] = df[col].clip(q01, q99)
-print("  Winsorize (0.01, 0.99): đã clip các biến skew mạnh.")
+print("  Winsorize (0.01, 0.99): pe, pb, eps, roa, roe, vonhoa_tts, nophaitra_vcsh, lnst_yoy.")
 
-# 3. Log transform biến lệch mạnh
+# 4. Log(1+x) cho biến tỷ lệ / fundamental
 if "pe" in df.columns:
     df["pe"] = np.log1p(df["pe"])
 if "pb" in df.columns:
@@ -475,16 +516,72 @@ if "eps" in df.columns:
     df["eps"] = np.log1p(df["eps"].clip(lower=0))
 if "lnst_yoy" in df.columns:
     df["lnst_yoy"] = np.sign(df["lnst_yoy"]) * np.log1p(np.abs(df["lnst_yoy"]))
-print("  Log transform: pe, pb, eps, lnst_yoy.")
+for col in ["roa", "roe", "vonhoa_tts", "nophaitra_vcsh"]:
+    if col in df.columns:
+        df[col] = np.log1p(df[col].clip(lower=0))
+print("  Log transform: pe, pb, eps, lnst_yoy, roa, roe, vonhoa_tts, nophaitra_vcsh.")
 
-# 4. Fill missing (fundamental) bằng median
+# 5. Fundamental: within-stock z-score (ROA, ROE) → composite profitability
+for _col in ["roa", "roe"]:
+    if _col in df.columns:
+        _mu = df.groupby("mack")[_col].transform("mean")
+        _std = df.groupby("mack")[_col].transform("std")
+        df[f"{_col}_z"] = np.where(_std > 1e-8, (df[_col] - _mu) / _std, 0)
+if "roa_z" in df.columns and "roe_z" in df.columns:
+    df["profitability"] = 0.5 * df["roa_z"] + 0.5 * df["roe_z"]
+    print("  Fundamental: within-stock z (roa, roe) → profitability = 0.5*roa_z + 0.5*roe_z.")
+
+# 6. Sentiment: news_dummy (trước khi log), log(1+news_count), sent_roll 5d, sent_shock
+if "news_count" in df.columns:
+    df["news_dummy"] = (df["news_count"].fillna(0) > 0).astype(int)
+    df["news_count"] = np.log1p(df["news_count"].clip(lower=0))
+_sent_col = "sent_score_mean" if "sent_score_mean" in df.columns else "sent_score"
+if _sent_col in df.columns:
+    df["sent_score_roll"] = df.groupby("mack", group_keys=False)[_sent_col].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df["sent_shock"] = df[_sent_col] - df["sent_score_roll"]
+print("  Sentiment: news_dummy, log(1+news_count), sent_score_roll (5d), sent_shock.")
+
+# 7. Volume ratio: log(1+volume_ratio) giảm skew
+if "volume_ratio" in df.columns:
+    df["volume_ratio"] = np.log1p(df["volume_ratio"].clip(lower=0))
+print("  Volume ratio: log(1+volume_ratio).")
+
+# 8. Feature interaction: momentum_sent, volume_sent (tăng AUC)
+if "ret_3d" in df.columns and "sent_score_roll" in df.columns:
+    df["momentum_sent"] = df["ret_3d"] * df["sent_score_roll"]
+if "volume_ratio" in df.columns and "sent_score_roll" in df.columns:
+    df["volume_sent"] = df["volume_ratio"] * df["sent_score_roll"]
+print("  Interaction: momentum_sent = ret_3d * sent_roll, volume_sent = vol_ratio * sent_roll.")
+
+# 9. Fill missing (fundamental) bằng median
 for col in fundamental_features:
     if col in df.columns and df[col].isna().any():
         df[col] = df[col].fillna(df[col].median())
-print("  Fill missing: fundamental bằng median.")
+if "profitability" in df.columns and df["profitability"].isna().any():
+    df["profitability"] = df["profitability"].fillna(df["profitability"].median())
+print("  Fill missing: fundamental + profitability.")
 
-# 5. StandardScaler: thực hiện trong train (RobustScaler theo từng fold)
-print("  Chuẩn hóa (scale): dùng RobustScaler khi train từng fold.\n")
+# 10. Cập nhật feature groups: profitability; sentiment gọn; bỏ stochastic_k; thêm interaction
+if "profitability" in df.columns:
+    feature_groups["Fundamental"] = [f for f in feature_groups["Fundamental"] if f not in ["roa", "roe"]] + ["profitability"]
+    print("  Fundamental: dùng profitability thay roa, roe.")
+_sent_keep = [c for c in ["sent_score_roll", "sent_shock", "news_dummy"] if c in df.columns]
+if _sent_keep:
+    feature_groups["Sentiment"] = _sent_keep
+    print("  Sentiment: giữ sent_score_roll, sent_shock, news_dummy.")
+if "stochastic_k" in feature_groups["Technical"]:
+    feature_groups["Technical"].remove("stochastic_k")
+    print("  Technical: bỏ stochastic_k (giữ RSI).")
+for _inter in ["momentum_sent", "volume_sent"]:
+    if _inter in df.columns and _inter not in feature_groups["Technical"]:
+        feature_groups["Technical"].append(_inter)
+feature_groups["Fund+Tech"] = feature_groups["Fundamental"] + feature_groups["Technical"]
+feature_groups["Fund+Sent"] = feature_groups["Fundamental"] + feature_groups["Sentiment"]
+feature_groups["Tech+Sent"] = feature_groups["Technical"] + feature_groups["Sentiment"]
+feature_groups["All"] = feature_groups["General"] + feature_groups["Fundamental"] + feature_groups["Technical"] + feature_groups["Sentiment"]
+
+# Chuẩn hóa: RobustScaler khi train (có thể tách Robust cho fundamental, Standard cho technical sau)
+print("  Chuẩn hóa: RobustScaler khi train từng fold (ret_5d_rank không scale).\n")
 
 # -------------------------------------------------------------
 # 12d. THỐNG KÊ MÔ TẢ (sau tiền xử lý) – kiểm tra biến đã đúng chưa
@@ -1057,6 +1154,64 @@ if sector_results:
 else:
     print("⚠️ Not enough data for sector analysis")
 
+
+# -------------------------------------------------------------
+# 17.4b Heatmap: 7 tổ hợp biến × 11 ngành (AUC)
+# -------------------------------------------------------------
+print("\n📊 17.4b Generating Heatmap: Feature Combinations × Sectors (AUC)...")
+
+MIN_SECTOR_SAMPLES = 300
+heatmap_rows = []
+combination_names = [k for k in feature_groups.keys() if k in results_df["Model"].values]
+
+for sector in sorted(df["sector"].unique()):
+    sector_df = df[df["sector"] == sector]
+    if len(sector_df) < MIN_SECTOR_SAMPLES:
+        continue
+    for name in combination_names:
+        feats = feature_groups[name]
+        res = train_mlp_time_split(sector_df, feats)
+        if res is not None:
+            heatmap_rows.append({
+                "Sector": sector,
+                "Combination": name,
+                "AUC": res["metrics"]["AUC"],
+            })
+
+if heatmap_rows:
+    heatmap_df = pd.DataFrame(heatmap_rows)
+    pivot_auc = heatmap_df.pivot(index="Sector", columns="Combination", values="AUC")
+    # Đảm bảo thứ tự cột giống combination_names
+    pivot_auc = pivot_auc[[c for c in combination_names if c in pivot_auc.columns]]
+
+    # Lưu CSV ma trận
+    pivot_auc.to_csv("heatmap_combination_sector.csv")
+    print("✓ Saved: heatmap_combination_sector.csv")
+
+    # Vẽ heatmap
+    fig, ax = plt.subplots(figsize=(12, 8))
+    sns.heatmap(
+        pivot_auc,
+        annot=True,
+        fmt=".3f",
+        cmap="RdYlGn",
+        center=0.5,
+        vmin=0.4,
+        vmax=0.7,
+        linewidths=0.5,
+        ax=ax,
+        cbar_kws={"label": "AUC"},
+    )
+    ax.set_title("Hiệu quả mô hình: 7 tổ hợp biến × ngành (AUC)", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Tổ hợp biến", fontsize=12)
+    ax.set_ylabel("Ngành", fontsize=12)
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(VIS_DIR, "heatmap_combination_sector.png"), dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"✓ Saved: {VIS_DIR}/heatmap_combination_sector.png")
+else:
+    print("⚠️ Not enough data for heatmap (combination × sector)")
 
 # -------------------------------------------------------------
 # 17.5 Save SHAP Summary Plot
