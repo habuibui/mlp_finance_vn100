@@ -55,14 +55,15 @@ os.makedirs(VIS_DIR, exist_ok=True)
 # --- Target: return 5 ngày tới (quantile 20/80) ---
 TARGET_RETURN_DAYS = 5
 
-# --- Chạy nhanh: giảm kích thước mạng, iter, splits, bootstrap/permutation ---
-MLP_HIDDEN = (64, 32)           # mạng nhỏ (mặc định cũ: (256, 128, 64, 32))
-MLP_MAX_ITER = 300              # số epoch tối đa (cũ: 1000)
-MLP_BATCH_SIZE = 256             # batch lớn = ít bước/epoch (cũ: 64)
-ROLLING_N_SPLITS = 3             # số fold rolling (cũ: 5)
-WILCOXON_N_SPLITS = 3            # số fold cho test Wilcoxon (cũ: 5)
-PERMUTATION_N_REPEATS = 3        # lặp permutation importance (cũ: 10)
-BOOTSTRAP_N = 200                # số lần bootstrap CI (cũ: 1000)
+# --- Cấu hình MLP & thống kê (bản gốc, chạy nhanh) ---
+# Nếu muốn thử mô hình mạnh hơn thì tăng dần các giá trị này, nhưng nên giữ cấu trúc chung.
+MLP_HIDDEN = (64, 32)           # mạng nhỏ (mặc định gốc)
+MLP_MAX_ITER = 300              # số epoch tối đa
+MLP_BATCH_SIZE = 256           # batch lớn = ít bước/epoch (nhanh hơn)
+ROLLING_N_SPLITS = 3           # số fold rolling
+WILCOXON_N_SPLITS = 3          # số fold cho Wilcoxon
+PERMUTATION_N_REPEATS = 3      # lặp permutation importance
+BOOTSTRAP_N = 200              # số lần bootstrap CI (AUC)
 
 # -------------------------------------------------------------
 # 3. HELPER: clean column names (strip whitespace, lower‑case)
@@ -359,11 +360,7 @@ print(f"  Target: return {_n}d tới (quantile 20/80). Lớp 1: {(df['target']==
 # -------------------------------------------------------------
 fundamental_features = [c for c in fund_features if c in df.columns]
 
-# 1. Nhóm Chung (General): giá, khối lượng, tỷ suất sinh lời
-general_features = ["close", "open", "high", "low", "volume", "ret_1d"]
-general_features = [c for c in general_features if c in df.columns]
-
-# 2. Nhóm Phân tích cơ bản (Fundamental): P/B, EPS, P/E, ROE, ROA, nợ/vốn, ...
+# 1. Nhóm Phân tích cơ bản (Fundamental): P/B, EPS, P/E, ROE, ROA, nợ/vốn, ...
 # (EV/EBITDA, PEG, Beta không có trong file → bỏ qua; thêm khi có dữ liệu)
 fundamental_features = [c for c in fund_features if c in df.columns]
 
@@ -392,14 +389,13 @@ if "news_count" in df.columns:
 sentiment_features = [c for c in sentiment_features if c in df.columns]
 
 feature_groups = {
-    "General": general_features,
     "Fundamental": fundamental_features,
     "Technical": technical_features,
     "Sentiment": sentiment_features,
     "Fund+Tech": fundamental_features + technical_features,
     "Fund+Sent": fundamental_features + sentiment_features,
     "Tech+Sent": technical_features + sentiment_features,
-    "All": general_features + fundamental_features + technical_features + sentiment_features,
+    "All": fundamental_features + technical_features + sentiment_features,
 }
 
 # Loại biến đa cộng tuyến (|r| > 0.9): giữ 1 trong mỗi cặp
@@ -430,7 +426,7 @@ if "rsi_14" in feature_groups["Technical"]:
             feature_groups["Technical"].remove(_r)
     feature_groups["Fund+Tech"] = feature_groups["Fundamental"] + feature_groups["Technical"]
     feature_groups["Tech+Sent"] = feature_groups["Technical"] + feature_groups["Sentiment"]
-    feature_groups["All"] = feature_groups["General"] + feature_groups["Fundamental"] + feature_groups["Technical"] + feature_groups["Sentiment"]
+    feature_groups["All"] = feature_groups["Fundamental"] + feature_groups["Technical"] + feature_groups["Sentiment"]
     print("  RSI: giữ rsi_14 đại diện (bỏ rsi_9, rsi_28).")
 
 # -------------------------------------------------------------
@@ -578,7 +574,7 @@ for _inter in ["momentum_sent", "volume_sent"]:
 feature_groups["Fund+Tech"] = feature_groups["Fundamental"] + feature_groups["Technical"]
 feature_groups["Fund+Sent"] = feature_groups["Fundamental"] + feature_groups["Sentiment"]
 feature_groups["Tech+Sent"] = feature_groups["Technical"] + feature_groups["Sentiment"]
-feature_groups["All"] = feature_groups["General"] + feature_groups["Fundamental"] + feature_groups["Technical"] + feature_groups["Sentiment"]
+feature_groups["All"] = feature_groups["Fundamental"] + feature_groups["Technical"] + feature_groups["Sentiment"]
 
 # Chuẩn hóa: RobustScaler khi train (có thể tách Robust cho fundamental, Standard cho technical sau)
 print("  Chuẩn hóa: RobustScaler khi train từng fold (ret_5d_rank không scale).\n")
@@ -603,10 +599,13 @@ if _dep_valid2:
     if "target" in _dep_valid2:
         _desc_dep2.loc["target", "value_counts"] = str(df["target"].value_counts().sort_index().to_dict())
     _path_dep2 = os.path.join(DATA_DIR, "descriptive_stats_dependent_after_preprocess.csv")
-    _desc_dep2.to_csv(_path_dep2, encoding="utf-8-sig")
-    print(f"  Biến phụ thuộc: {_dep_valid2}")
-    print(_desc_dep2.round(4).to_string())
-    print(f"  -> Đã lưu: {_path_dep2}")
+    try:
+        _desc_dep2.to_csv(_path_dep2, encoding="utf-8-sig")
+        print(f"  Biến phụ thuộc: {_dep_valid2}")
+        print(_desc_dep2.round(4).to_string())
+        print(f"  -> Đã lưu: {_path_dep2}")
+    except PermissionError:
+        print(f"⚠️ Không ghi được {_path_dep2} (Permission denied). Đóng file nếu đang mở trong Excel rồi chạy lại, hoặc xóa file cũ.")
 
 if _all_feat2:
     _desc_ind2 = df[_all_feat2].describe(percentiles=[0.25, 0.5, 0.75]).T
@@ -617,10 +616,13 @@ if _all_feat2:
     except Exception:
         pass
     _path_ind2 = os.path.join(DATA_DIR, "descriptive_stats_independent_after_preprocess.csv")
-    _desc_ind2.to_csv(_path_ind2, encoding="utf-8-sig")
-    print(f"\n  Biến độc lập: {len(_all_feat2)} biến (xem file để đầy đủ)")
-    print(_desc_ind2[["count", "mean", "std", "min", "median", "max", "missing"]].head(15).round(4).to_string())
-    print(f"  -> Đã lưu: {_path_ind2}")
+    try:
+        _desc_ind2.to_csv(_path_ind2, encoding="utf-8-sig")
+        print(f"\n  Biến độc lập: {len(_all_feat2)} biến (xem file để đầy đủ)")
+        print(_desc_ind2[["count", "mean", "std", "min", "median", "max", "missing"]].head(15).round(4).to_string())
+        print(f"  -> Đã lưu: {_path_ind2}")
+    except PermissionError:
+        print(f"⚠️ Không ghi được {_path_ind2} (Permission denied). Đóng file nếu đang mở trong Excel rồi chạy lại, hoặc xóa file cũ.")
 
 print("\n  [Đã kiểm tra biến sau tiền xử lý. Tiếp tục huấn luyện mô hình...]\n")
 
@@ -1232,6 +1234,28 @@ if shap_values is not None and X_test_shap is not None:
     plt.savefig(os.path.join(VIS_DIR, "shap_summary.png"), dpi=150, bbox_inches="tight")
     plt.show()
     print(f"✓ Saved: {VIS_DIR}/shap_summary.png")
+
+    # Biểu đồ tương tác SHAP riêng cho SMA_14 và RSI_14 (tránh chồng text)
+    if "sma_14" in best_res["features"] and "rsi_14" in best_res["features"]:
+        try:
+            plt.figure(figsize=(8, 6))
+            shap.dependence_plot(
+                "sma_14",
+                shap_vals_plot,
+                X_test_df,
+                interaction_index=best_res["features"].index("rsi_14"),
+                show=False
+            )
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(VIS_DIR, "shap_interaction_sma14_rsi14.png"),
+                dpi=150,
+                bbox_inches="tight"
+            )
+            plt.close()
+            print("✓ Saved: shap_interaction_sma14_rsi14.png (SMA_14 × RSI_14, không bị chồng text)")
+        except Exception as e:
+            print(f"⚠️ Không vẽ được SHAP interaction SMA_14 × RSI_14: {e}")
 else:
     print("⚠️ SHAP plot not available (previous SHAP analysis failed)")
 
