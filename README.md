@@ -1,32 +1,37 @@
-# Dự án dự báo cổ phiếu: Sentiment + MLP
+# Dự án dự báo cổ phiếu: MLP
 
 Pipeline gồm **hai bước**: (1) phân tích cảm xúc tin tức bằng PhoBERT, (2) gộp dữ liệu giá – cơ bản – sentiment và huấn luyện mô hình MLP để dự báo xu hướng lợi nhuận (phân loại nhị phân theo quantile return).
 
 ---
 
-## Cấu trúc thư mục và file
+## Cấu trúc file cần thiết
+
+Toàn bộ cấu trúc thư mục và file của dự án, gồm **file cần có sẵn** (đầu vào / cấu hình) và **file do pipeline tạo ra** (đầu ra).
+
+### Tổng quan cây thư mục
 
 ```
 K224141657/
-├── README.md                    # File này – mô tả cấu trúc và cách chạy
-├── requirements.txt             # Thư viện Python cần thiết
-├── run_all.bat                  # Script chạy toàn bộ pipeline (Windows)
+├── README.md                          # Mô tả dự án, cấu trúc file và cách chạy
+├── requirements.txt                   # Thư viện Python (numpy, pandas, torch, transformers, ...)
+├── run_all.bat                        # Script chạy toàn bộ pipeline (Windows)
 │
-├── sentiment_analysis.py        # Bước 1: Phân tích cảm xúc (PhoBERT) → news_with_sentiment.csv
-├── mlp_complete.py              # Bước 2: Gộp dữ liệu, feature, train MLP, đánh giá, vẽ đồ thị
-├── adidaaphat.ipynb             # Notebook thử nghiệm / phân tích (nếu có)
-├── run.ipynb                    # Notebook chạy nhanh (nếu có)
+├── sentiment_analysis.py              # Bước 1: Phân tích cảm xúc PhoBERT → news_with_sentiment.csv
+├── mlp_complete.py                    # Bước 2: Gộp dữ liệu, feature, train MLP, đánh giá, vẽ đồ thị
 │
-├── data/                        # Dữ liệu đầu vào và một số file trung gian/đầu ra
-│   ├── ohlc.csv                 # Giá OHLC + volume theo ngày, theo mã (mack)
-│   ├── fundamental.csv         # Chỉ số cơ bản theo quý/năm (eps, roe, roa, pb, pe, ...)
-│   ├── news.csv                 # Tin tức thô (mack, date, title/content/summary)
-│   ├── news_with_sentiment.csv # Tin đã gán sentiment (tạo bởi sentiment_analysis.py)
-│   ├── descriptive_stats*.csv # Thống kê mô tả (biến phụ thuộc/độc lập) – sinh bởi mlp_complete
-│   └── (các file diagnostic/validation nếu có)
+├── data/                              # Dữ liệu đầu vào (bắt buộc) + file trung gian/đầu ra
+│   ├── ohlc.csv                       # [ĐẦU VÀO] Giá OHLC + volume theo ngày, theo mã (mack)
+│   ├── fundamental.csv                # [ĐẦU VÀO] Chỉ số cơ bản theo quý/năm
+│   ├── news.csv                       # [ĐẦU VÀO] Tin tức thô (mack, date, title/content/summary)
+│   ├── news_with_sentiment.csv        # [ĐẦU RA bước 1] Tin đã gán sentiment (sentiment_analysis.py)
+│   ├── descriptive_stats.csv          # [ĐẦU RA] Thống kê mô tả tổng hợp (mlp_complete.py)
+│   ├── descriptive_stats_dependent.csv
+│   ├── descriptive_stats_independent.csv
+│   ├── descriptive_stats_dependent_after_preprocess.csv
+│   └── descriptive_stats_independent_after_preprocess.csv
 │
-├── visualizations/              # Biểu đồ do pipeline sinh ra (tự tạo khi chạy)
-│   ├── sentiment_distribution.png
+├── visualizations/                    # Biểu đồ do pipeline sinh ra khi chạy
+│   ├── sentiment_distribution.png     # Phân phối sentiment (bước 1)
 │   ├── ablation_auc_bar.png
 │   ├── rolling_auc.png
 │   ├── precision_recall_curve.png
@@ -35,19 +40,34 @@ K224141657/
 │   ├── permutation_importance.png
 │   ├── feature_correlation.png
 │   ├── learning_curve.png
+│   ├── radar_metrics.png
 │   ├── sector_performance.png
+│   ├── heatmap_combination_sector.png
 │   ├── shap_summary.png
+│   ├── shap_interaction_sma14_rsi14.png
 │   ├── auc_confidence_intervals.png
 │   ├── statistical_comparison.png
-│   ├── feature_combination_comparison.png
-│   └── heatmap_combination_sector.png
+│   └── feature_combination_comparison.png
 │
-├── model_results.csv            # Kết quả AUC, Accuracy, F1,... theo từng tổ hợp feature
-├── sector_results.csv           # Hiệu suất mô hình tốt nhất theo từng ngành
-├── statistical_tests.csv        # Kiểm định Wilcoxon (so sánh mô hình)
-├── feature_combination_analysis.csv  # Phân tích ablation chi tiết
-└── heatmap_combination_sector.csv    # Heatmap tổ hợp feature × sector
+├── model_results.csv                  # [ĐẦU RA] AUC, Accuracy, F1,... theo tổ hợp feature
+├── sector_results.csv                 # [ĐẦU RA] Hiệu suất mô hình theo từng ngành
+├── statistical_tests.csv              # [ĐẦU RA] Kiểm định Wilcoxon (so sánh mô hình)
+├── feature_combination_analysis.csv   # [ĐẦU RA] Phân tích ablation chi tiết
+└── heatmap_combination_sector.csv     # [ĐẦU RA] Heatmap tổ hợp feature × sector
 ```
+
+### Bảng tóm tắt theo vai trò
+
+| Vai trò | File / thư mục | Ghi chú |
+|--------|-----------------|--------|
+| **Cấu hình & chạy** | `README.md`, `requirements.txt`, `run_all.bat` | Cần có sẵn (trừ output của README). |
+| **Script chính** | `sentiment_analysis.py`, `mlp_complete.py` | Bắt buộc để chạy pipeline. |
+| **Notebook** | `adidaaphat.ipynb`, `run.ipynb` | Tùy chọn, dùng thử nghiệm / chạy nhanh. |
+| **Dữ liệu đầu vào** | `data/ohlc.csv`, `data/fundamental.csv`, `data/news.csv` | Bắt buộc; thiếu thì pipeline báo lỗi. |
+| **Đầu ra bước 1** | `data/news_with_sentiment.csv` | Tạo bởi `sentiment_analysis.py`; nếu có sẵn có thể bỏ qua bước 1. |
+| **Đầu ra bước 2 (data/)** | `data/descriptive_stats*.csv` | Tạo bởi `mlp_complete.py`. |
+| **Đầu ra bước 2 (gốc)** | `model_results.csv`, `sector_results.csv`, `statistical_tests.csv`, `feature_combination_analysis.csv`, `heatmap_combination_sector.csv` | Tạo bởi `mlp_complete.py`. |
+| **Biểu đồ** | `visualizations/*.png` | Thư mục tự tạo khi chạy; đủ các file trên sau khi chạy đủ pipeline. |
 
 ---
 
@@ -106,6 +126,8 @@ Luồng xử lý chính trong code:
 ---
 
 ## Kết quả đầu ra
+
+*(Danh sách file đầu ra chi tiết xem mục **Cấu trúc file cần thiết** ở trên.)*
 
 - **CSV (thư mục gốc)**  
   - `model_results.csv`: Accuracy, AUC, Precision, Recall, F1 (và có thể AP) theo từng tổ hợp feature / mô hình.  
